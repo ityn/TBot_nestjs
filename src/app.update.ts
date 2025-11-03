@@ -8,7 +8,6 @@ import { UsersService } from './database/models/users/users.service';
 import { UserRole } from './database/models/users/user.entity';
 import { TelegramClientService } from './telegram/telegram-client.service';
 import { WorkShiftsService } from './database/models/work-shifts/work-shifts.service';
-import { SchedulerService } from './scheduler/scheduler.service';
 import { ChatsService } from './database/models/chats/chats.service';
 import { PollsService } from './polls/polls.service';
 
@@ -27,7 +26,6 @@ export class AppUpdate {
       private readonly usersService: UsersService,
       private readonly telegramClient: TelegramClientService,
       private readonly workShiftsService: WorkShiftsService,
-      private readonly schedulerService: SchedulerService,
       private readonly chatsService: ChatsService,
       private readonly pollsService: PollsService,
   ) {}
