@@ -19,25 +19,58 @@ export class SchedulerService implements OnModuleInit {
     private readonly chatsService: ChatsService,
     private readonly pollsService: PollsService,
     private readonly usersService: UsersService,
-  ) {}
+  ) {
+    this.logger.log('SchedulerService constructor called');
+    if (!this.bot) {
+      this.logger.error('CRITICAL: Bot is not available in constructor! @InjectBot() failed.');
+    } else {
+      this.logger.log('Bot successfully injected in constructor');
+    }
+  }
 
   onModuleInit() {
-    const timezone = this.configService.get<string>('TIMEZONE') || 'Asia/Novosibirsk';
-    
-    // Schedule daily poll at 20:00 (8 PM)
-    cron.schedule('0 20 * * *', async () => {
-      this.logger.log('Scheduled poll trigger at 20:00');
-      await this.sendAutoPoll();
-    }, {
-      timezone
-    });
+    try {
+      this.logger.log('SchedulerService onModuleInit called');
+      const timezone = this.configService.get<string>('TIMEZONE') || 'Asia/Novosibirsk';
+      this.logger.log(`Using timezone: ${timezone}`);
+      
+      if (!this.bot) {
+        this.logger.error('Bot is not available in onModuleInit! Cannot schedule tasks.');
+        return;
+      }
+      
+      // Schedule daily poll at 20:00 (8 PM)
+      const pollTask = cron.schedule('0 20 * * *', async () => {
+        this.logger.log(`[CRON] Scheduled poll trigger at 20:00 (${timezone})`);
+        await this.sendAutoPoll();
+      }, {
+        timezone
+      });
+      
+      if (pollTask) {
+        this.logger.log('Poll cron task scheduled successfully');
+      } else {
+        this.logger.error('Failed to schedule poll cron task!');
+      }
 
-    // Daily reminder at 08:50 to open shift
-    cron.schedule('50 8 * * *', async () => {
-      await this.remindOpenShift(timezone);
-    }, { timezone });
+      // Daily reminder at 08:50 to open shift
+      const reminderTask = cron.schedule('50 8 * * *', async () => {
+        this.logger.log(`[CRON] Open shift reminder trigger at 08:50 (${timezone})`);
+        await this.remindOpenShift(timezone);
+      }, { 
+        timezone
+      });
+      
+      if (reminderTask) {
+        this.logger.log('Reminder cron task scheduled successfully');
+      } else {
+        this.logger.error('Failed to schedule reminder cron task!');
+      }
 
-    this.logger.log(`Scheduler initialized. Daily poll will run at 20:00 (${timezone})`);
+      this.logger.log(`Scheduler initialized successfully. Daily poll will run at 20:00 (${timezone}), reminder at 08:50 (${timezone})`);
+    } catch (error) {
+      this.logger.error(`Failed to initialize scheduler: ${String(error)}`, error instanceof Error ? error.stack : '');
+    }
   }
 
   async sendAutoPoll() {
