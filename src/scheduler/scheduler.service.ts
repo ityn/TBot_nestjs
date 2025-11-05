@@ -111,17 +111,25 @@ export class SchedulerService implements OnModuleInit {
       this.logger.log('sendAutoPoll() called - starting poll sending process');
       // Get all active chats
       const chats = await this.chatsService.findAll();
-      this.logger.log(`Found ${chats.length} active chats`);
+      this.logger.log(`Found ${chats.length} active chats in database`);
       
       if (chats.length === 0) {
-        this.logger.warn('No active chats found. Skipping scheduled poll.');
+        this.logger.warn('No active chats found in database. Skipping scheduled poll.');
+        this.logger.warn('NOTE: Chats are registered when bot is added to a group via onBotAddedToChat handler.');
         return;
       }
+
+      // Log all chat IDs for debugging
+      chats.forEach((chat, index) => {
+        this.logger.log(`Chat ${index + 1}: chatId='${chat.chatId}' (type: ${typeof chat.chatId}), title='${chat.title || 'N/A'}', type='${chat.type || 'N/A'}'`);
+      });
 
       // Send poll to all chats
       for (const chat of chats) {
         const chatId = Number(chat.chatId);
         const pollKey = `${chatId}:shift_poll`;
+        
+        this.logger.log(`Attempting to send poll to chatId=${chatId} (original: '${chat.chatId}')`);
         
         try {
           const message = await this.bot.telegram.sendMessage(

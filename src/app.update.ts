@@ -205,6 +205,22 @@ export class AppUpdate {
   async getMessage(@Message('text') message: string, @Ctx() ctx: Context){
     if (!isGroupChat(ctx)) return
     
+    // Ensure chat is registered in database
+    const chatId = ctx.chat?.id;
+    if (chatId) {
+      try {
+        const existingChat = await this.chatsService.findOneByChatId(String(chatId));
+        if (!existingChat) {
+          const title = (ctx.chat as any).title || null;
+          const type = ctx.chat?.type || null;
+          await this.chatsService.findOrCreate(String(chatId), title, type);
+          this.logger.log(`Chat ${chatId} auto-registered in database from message handler`);
+        }
+      } catch (e) {
+        this.logger.warn(`Failed to register chat ${chatId}: ${String(e)}`);
+      }
+    }
+    
     Logger.debug(`Text in group ${ctx.chat?.id} from @${ctx.from?.username}: ${message}`, 'AppUpdate')
     
     // Check for pending shift closure
@@ -484,6 +500,55 @@ export class AppUpdate {
     Logger.debug(`Callback from @${context.from?.username}: ${userAnswer}`, 'AppUpdate')
     await context.reply(`${context.from?.username} answer is: ${userAnswer}`)
 
+  }
+
+  @Command('checkchats')
+  async checkChats(@Ctx() ctx: Context) {
+    this.logger.log(`Checkchats command received from @${ctx.from?.username} in chat ${ctx.chat?.id}`, 'AppUpdate')
+    if (!isGroupChat(ctx)) {
+      await this.replyWithName(ctx, 'Эта команда работает только в группах.')
+      return
+    }
+    try {
+      const isGroupAdmin = await isAdmin(ctx)
+      if (!isGroupAdmin) {
+        await this.replyWithName(ctx, 'Эта команда доступна только администраторам группы.')
+        return
+      }
+      
+      const chats = await this.chatsService.findAll()
+      if (chats.length === 0) {
+        await ctx.reply('❌ В базе данных не найдено ни одного зарегистрированного чата.\n\nБот должен автоматически регистрировать чаты при:\n1. Добавлении бота в группу (onBotAddedToChat)\n2. Первом сообщении в группе (getMessage)\n\nПопробуйте написать любое сообщение в этом чате, чтобы автоматически зарегистрировать его.')
+        return
+      }
+      
+      let message = `📋 Найдено чатов в базе: ${chats.length}\n\n`
+      chats.forEach((chat, index) => {
+        const isCurrentChat = chat.chatId === String(ctx.chat?.id)
+        message += `${isCurrentChat ? '✅' : '📌'} ${index + 1}. ID: ${chat.chatId}, Название: ${chat.title || 'N/A'}, Тип: ${chat.type || 'N/A'}\n`
+      })
+      
+      const currentChatId = String(ctx.chat?.id)
+      const currentChatExists = chats.some(c => c.chatId === currentChatId)
+      if (!currentChatExists) {
+        // Auto-register current chat
+        try {
+          const title = (ctx.chat as any).title || null
+          const type = ctx.chat?.type || null
+          await this.chatsService.findOrCreate(currentChatId, title, type)
+          message += `\n✅ Текущий чат (${currentChatId}) зарегистрирован в базе данных.`
+          this.logger.log(`Chat ${currentChatId} registered via checkchats command`)
+        } catch (e) {
+          message += `\n❌ Ошибка регистрации текущего чата: ${String(e)}`
+          this.logger.error(`Failed to register chat ${currentChatId}: ${String(e)}`)
+        }
+      }
+      
+      await ctx.reply(message)
+    } catch (e) {
+      this.logger.error(`Error in checkchats command: ${String(e)}`)
+      await ctx.reply(`Ошибка при проверке чатов: ${String(e)}`)
+    }
   }
 
   @Help()
