@@ -34,29 +34,62 @@ export class SchedulerService implements OnModuleInit {
       const timezone = this.configService.get<string>('TIMEZONE') || 'Asia/Novosibirsk';
       this.logger.log(`Using timezone: ${timezone}`);
       
+      // Log current time in timezone
+      const now = new Date();
+      this.logger.log(`Current UTC time: ${now.toISOString()}`);
+      try {
+        const tzTime = new Date(now.toLocaleString('en-US', { timeZone: timezone }));
+        this.logger.log(`Current time in ${timezone}: ${tzTime.toLocaleString('ru-RU')}`);
+      } catch (e) {
+        this.logger.warn(`Failed to get time in timezone ${timezone}: ${String(e)}`);
+      }
+      
       if (!this.bot) {
         this.logger.error('Bot is not available in onModuleInit! Cannot schedule tasks.');
         return;
       }
       
+      // TEST: Schedule a test task every minute to verify cron works
+      const testTask = cron.schedule('* * * * *', () => {
+        const testTime = new Date();
+        this.logger.log(`[CRON TEST] Test task triggered at ${testTime.toISOString()}`);
+      }, {
+        timezone
+      });
+      if (testTask) {
+        this.logger.log('Test cron task (every minute) scheduled successfully for debugging');
+      }
+      
       // Schedule daily poll at 20:00 (8 PM)
       const pollTask = cron.schedule('0 20 * * *', async () => {
-        this.logger.log(`[CRON] Scheduled poll trigger at 20:00 (${timezone})`);
-        await this.sendAutoPoll();
+        try {
+          const triggerTime = new Date();
+          this.logger.log(`[CRON] Scheduled poll trigger at 20:00 (${timezone}) - Current time: ${triggerTime.toISOString()}`);
+          await this.sendAutoPoll();
+        } catch (error) {
+          this.logger.error(`Error in poll cron task: ${String(error)}`, error instanceof Error ? error.stack : '');
+        }
       }, {
         timezone
       });
       
       if (pollTask) {
         this.logger.log('Poll cron task scheduled successfully');
+        // Verify the task is actually running
+        this.logger.log(`Poll task scheduled for: 0 20 * * * (20:00 in ${timezone})`);
       } else {
         this.logger.error('Failed to schedule poll cron task!');
       }
 
       // Daily reminder at 08:50 to open shift
       const reminderTask = cron.schedule('50 8 * * *', async () => {
-        this.logger.log(`[CRON] Open shift reminder trigger at 08:50 (${timezone})`);
-        await this.remindOpenShift(timezone);
+        try {
+          const triggerTime = new Date();
+          this.logger.log(`[CRON] Open shift reminder trigger at 08:50 (${timezone}) - Current time: ${triggerTime.toISOString()}`);
+          await this.remindOpenShift(timezone);
+        } catch (error) {
+          this.logger.error(`Error in reminder cron task: ${String(error)}`, error instanceof Error ? error.stack : '');
+        }
       }, { 
         timezone
       });
@@ -75,8 +108,10 @@ export class SchedulerService implements OnModuleInit {
 
   async sendAutoPoll() {
     try {
+      this.logger.log('sendAutoPoll() called - starting poll sending process');
       // Get all active chats
       const chats = await this.chatsService.findAll();
+      this.logger.log(`Found ${chats.length} active chats`);
       
       if (chats.length === 0) {
         this.logger.warn('No active chats found. Skipping scheduled poll.');
