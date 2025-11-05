@@ -50,14 +50,23 @@ export class SchedulerService implements OnModuleInit {
       }
       
       // TEST: Schedule a test task every minute to verify cron works
-      const testTask = cron.schedule('* * * * *', () => {
-        const testTime = new Date();
-        this.logger.log(`[CRON TEST] Test task triggered at ${testTime.toISOString()}`);
+      // NOTE: This will also test sendAutoPoll() - remove or disable in production
+      const testTask = cron.schedule('* * * * *', async () => {
+        try {
+          const testTime = new Date();
+          this.logger.log(`[CRON TEST] Test task triggered at ${testTime.toISOString()}`);
+          // Test sendAutoPoll every minute for debugging (remove in production)
+          this.logger.log(`[CRON TEST] Calling sendAutoPoll() for testing...`);
+          await this.sendAutoPoll();
+        } catch (error) {
+          this.logger.error(`[CRON TEST] Error in test task: ${String(error)}`, error instanceof Error ? error.stack : '');
+        }
       }, {
         timezone
       });
       if (testTask) {
         this.logger.log('Test cron task (every minute) scheduled successfully for debugging');
+        this.logger.warn('WARNING: Test task calls sendAutoPoll() every minute - disable in production!');
       }
       
       // Schedule daily poll at 20:00 (8 PM)
@@ -132,6 +141,23 @@ export class SchedulerService implements OnModuleInit {
         this.logger.log(`Attempting to send poll to chatId=${chatId} (original: '${chat.chatId}')`);
         
         try {
+          // Verify bot is available
+          if (!this.bot || !this.bot.telegram) {
+            this.logger.error(`Bot or bot.telegram is not available for chatId=${chatId}`);
+            continue;
+          }
+          
+          // Verify bot can access the chat
+          try {
+            this.logger.log(`Checking bot access to chatId=${chatId}...`);
+            await this.bot.telegram.getChat(chatId);
+            this.logger.log(`Bot has access to chatId=${chatId}`);
+          } catch (accessError) {
+            this.logger.warn(`Bot cannot access chatId=${chatId}: ${String(accessError)}. Skipping this chat.`);
+            continue;
+          }
+          
+          this.logger.log(`Calling bot.telegram.sendMessage for chatId=${chatId}...`);
           const message = await this.bot.telegram.sendMessage(
             chatId,
             '📋 Опрос: Кто завтра выходит на смену?\n⏱ Время на ответ: 30 минут\n\n✅ Выхожу: 0\n❌ Не выхожу: 0',
@@ -211,9 +237,21 @@ export class SchedulerService implements OnModuleInit {
           }, 30 * 60 * 1000); // 30 minutes
           
           this.pollsService.setShiftPoll(pollKey, poll);
-          this.logger.log(`Scheduled poll sent to chatId=${chatId}, messageId=${(message as any).message_id}`);
+          this.logger.log(`✅ Scheduled poll sent successfully to chatId=${chatId}, messageId=${(message as any).message_id}`);
         } catch (e) {
-          this.logger.error(`Failed to send scheduled poll to chatId=${chatId}: ${String(e)}`);
+          const errorMessage = e instanceof Error ? e.message : String(e);
+          const errorStack = e instanceof Error ? e.stack : '';
+          this.logger.error(`❌ Failed to send scheduled poll to chatId=${chatId}: ${errorMessage}`);
+          if (errorStack) {
+            this.logger.error(`Error stack: ${errorStack}`);
+          }
+          // Log specific error types
+          if (e && typeof e === 'object' && 'response' in e) {
+            this.logger.error(`Telegram API response: ${JSON.stringify((e as any).response)}`);
+          }
+          if (e && typeof e === 'object' && 'code' in e) {
+            this.logger.error(`Error code: ${(e as any).code}`);
+          }
         }
       }
     } catch (e) {
