@@ -50,7 +50,8 @@ export class SchedulerService implements OnModuleInit {
       }
       
       // TEST: Schedule a test task every minute to verify cron works
-      // NOTE: This will also test sendAutoPoll() - remove or disable in production
+      // DISABLED: Test task removed - uncomment for debugging if needed
+      /*
       const testTask = cron.schedule('* * * * *', async () => {
         try {
           const testTime = new Date();
@@ -68,6 +69,7 @@ export class SchedulerService implements OnModuleInit {
         this.logger.log('Test cron task (every minute) scheduled successfully for debugging');
         this.logger.warn('WARNING: Test task calls sendAutoPoll() every minute - disable in production!');
       }
+      */
       
       // Schedule daily poll at 20:00 (8 PM)
       const pollTask = cron.schedule('0 20 * * *', async () => {
