@@ -347,9 +347,19 @@ export class SchedulerService implements OnModuleInit {
           
           const lines: string[] = []
           for (const shift of shifts) {
-            const tag = shift.login ? `@${shift.login}` : shift.telegramId
             if (!shift.isOpened) {
-              lines.push(`• ${tag} — не забудьте открыть смену командой /openshift`)
+              // Get user to get firstName
+              let displayName = shift.login ? `@${shift.login}` : shift.telegramId
+              try {
+                const user = await this.usersService.findOneByTelegramId(shift.telegramId)
+                if (user && user.firstName) {
+                  const username = shift.login ? `@${shift.login}` : ''
+                  displayName = username ? `${user.firstName} (${username})` : user.firstName
+                }
+              } catch (e) {
+                this.logger.warn(`Failed to get user for telegramId=${shift.telegramId}: ${String(e)}`)
+              }
+              lines.push(`• ${displayName} — не забудьте открыть смену командой /openshift`)
             }
           }
           
@@ -401,8 +411,18 @@ export class SchedulerService implements OnModuleInit {
             // Only remind if shift is opened but not closed yet
             // Shift is closed if itemsIssued > 0
             if (shift.isOpened && (!shift.itemsIssued || shift.itemsIssued === 0)) {
-              const tag = shift.login ? `@${shift.login}` : shift.telegramId
-              lines.push(`• ${tag} — не забудьте закрыть смену командой /closeshift`)
+              // Get user to get firstName
+              let displayName = shift.login ? `@${shift.login}` : shift.telegramId
+              try {
+                const user = await this.usersService.findOneByTelegramId(shift.telegramId)
+                if (user && user.firstName) {
+                  const username = shift.login ? `@${shift.login}` : ''
+                  displayName = username ? `${user.firstName} (${username})` : user.firstName
+                }
+              } catch (e) {
+                this.logger.warn(`Failed to get user for telegramId=${shift.telegramId}: ${String(e)}`)
+              }
+              lines.push(`• ${displayName} — не забудьте закрыть смену командой /closeshift`)
             }
           }
           
