@@ -90,6 +90,25 @@ export class SchedulerService implements OnModuleInit {
         this.logger.error('Failed to schedule open shift reminder cron task!');
       }
 
+      // Daily poll at 20:00 - "Who is on shift tomorrow?"
+      const pollTask = cron.schedule('0 20 * * *', async () => {
+        try {
+          const triggerTime = new Date();
+          this.logger.log(`[CRON] Shift poll trigger at 20:00 (${timezone}) - Current time: ${triggerTime.toISOString()}`);
+          await this.sendAutoPoll();
+        } catch (error) {
+          this.logger.error(`Error in shift poll cron task: ${String(error)}`, error instanceof Error ? error.stack : '');
+        }
+      }, { 
+        timezone
+      });
+      
+      if (pollTask) {
+        this.logger.log('Shift poll cron task scheduled successfully');
+      } else {
+        this.logger.error('Failed to schedule shift poll cron task!');
+      }
+
       // Daily reminder at 20:55 to close shift
       const reminderCloseTask = cron.schedule('55 20 * * *', async () => {
         try {
@@ -109,7 +128,7 @@ export class SchedulerService implements OnModuleInit {
         this.logger.error('Failed to schedule close shift reminder cron task!');
       }
 
-      this.logger.log(`Scheduler initialized successfully. Open shift reminder at 08:50 (${timezone}), close shift reminder at 20:55 (${timezone})`);
+      this.logger.log(`Scheduler initialized successfully. Open shift reminder at 08:50 (${timezone}), shift poll at 20:00 (${timezone}), close shift reminder at 20:55 (${timezone})`);
     } catch (error) {
       this.logger.error(`Failed to initialize scheduler: ${String(error)}`, error instanceof Error ? error.stack : '');
     }
