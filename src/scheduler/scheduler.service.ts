@@ -71,47 +71,45 @@ export class SchedulerService implements OnModuleInit {
       }
       */
       
-      // Schedule daily poll at 20:00 (8 PM)
-      const pollTask = cron.schedule('0 20 * * *', async () => {
-        try {
-          const triggerTime = new Date();
-          this.logger.log(`[CRON] Scheduled poll trigger at 20:00 (${timezone}) - Current time: ${triggerTime.toISOString()}`);
-          await this.sendAutoPoll();
-        } catch (error) {
-          this.logger.error(`Error in poll cron task: ${String(error)}`, error instanceof Error ? error.stack : '');
-        }
-      }, {
-        timezone
-      });
-      
-      if (pollTask) {
-        this.logger.log('Poll cron task scheduled successfully');
-        // Verify the task is actually running
-        this.logger.log(`Poll task scheduled for: 0 20 * * * (20:00 in ${timezone})`);
-      } else {
-        this.logger.error('Failed to schedule poll cron task!');
-      }
-
       // Daily reminder at 08:50 to open shift
-      const reminderTask = cron.schedule('50 8 * * *', async () => {
+      const reminderOpenTask = cron.schedule('50 8 * * *', async () => {
         try {
           const triggerTime = new Date();
           this.logger.log(`[CRON] Open shift reminder trigger at 08:50 (${timezone}) - Current time: ${triggerTime.toISOString()}`);
           await this.remindOpenShift(timezone);
         } catch (error) {
-          this.logger.error(`Error in reminder cron task: ${String(error)}`, error instanceof Error ? error.stack : '');
+          this.logger.error(`Error in open shift reminder cron task: ${String(error)}`, error instanceof Error ? error.stack : '');
         }
       }, { 
         timezone
       });
       
-      if (reminderTask) {
-        this.logger.log('Reminder cron task scheduled successfully');
+      if (reminderOpenTask) {
+        this.logger.log('Open shift reminder cron task scheduled successfully');
       } else {
-        this.logger.error('Failed to schedule reminder cron task!');
+        this.logger.error('Failed to schedule open shift reminder cron task!');
       }
 
-      this.logger.log(`Scheduler initialized successfully. Daily poll will run at 20:00 (${timezone}), reminder at 08:50 (${timezone})`);
+      // Daily reminder at 20:55 to close shift
+      const reminderCloseTask = cron.schedule('55 20 * * *', async () => {
+        try {
+          const triggerTime = new Date();
+          this.logger.log(`[CRON] Close shift reminder trigger at 20:55 (${timezone}) - Current time: ${triggerTime.toISOString()}`);
+          await this.remindCloseShift(timezone);
+        } catch (error) {
+          this.logger.error(`Error in close shift reminder cron task: ${String(error)}`, error instanceof Error ? error.stack : '');
+        }
+      }, { 
+        timezone
+      });
+      
+      if (reminderCloseTask) {
+        this.logger.log('Close shift reminder cron task scheduled successfully');
+      } else {
+        this.logger.error('Failed to schedule close shift reminder cron task!');
+      }
+
+      this.logger.log(`Scheduler initialized successfully. Open shift reminder at 08:50 (${timezone}), close shift reminder at 20:55 (${timezone})`);
     } catch (error) {
       this.logger.error(`Failed to initialize scheduler: ${String(error)}`, error instanceof Error ? error.stack : '');
     }
@@ -372,6 +370,59 @@ export class SchedulerService implements OnModuleInit {
       }
     } catch (e) {
       this.logger.error(`Failed to get chats for open shift reminder: ${String(e)}`)
+    }
+  }
+
+  async remindCloseShift(timezone: string) {
+    try {
+      // Get all active chats
+      const chats = await this.chatsService.findAll();
+      
+      if (chats.length === 0) {
+        this.logger.warn('No active chats found. Skipping close shift reminder.');
+        return;
+      }
+
+      const now = new Date();
+      const { start, end } = this.toUtcRangeForLocalDay(now);
+
+      // Send reminder to each chat
+      for (const chat of chats) {
+        const chatId = Number(chat.chatId);
+        
+        try {
+          const shifts = await this.workShiftsService.findByDateRangeForChat(start, end, chat.chatId);
+          if (!shifts || shifts.length === 0) {
+            continue; // No shifts for this chat today
+          }
+          
+          const lines: string[] = []
+          for (const shift of shifts) {
+            // Only remind if shift is opened but not closed yet
+            // Shift is closed if itemsIssued > 0
+            if (shift.isOpened && (!shift.itemsIssued || shift.itemsIssued === 0)) {
+              const tag = shift.login ? `@${shift.login}` : shift.telegramId
+              lines.push(`• ${tag} — не забудьте закрыть смену командой /closeshift`)
+            }
+          }
+          
+          if (lines.length === 0) {
+            continue; // All shifts already closed for this chat
+          }
+          
+          const text = [
+            '⏰ Напоминание (20:55): Закройте смену на сегодня!',
+            ...lines,
+          ].join('\n')
+          
+          await this.bot.telegram.sendMessage(chatId, text)
+          this.logger.log(`Close shift reminder sent to chatId=${chatId}`)
+        } catch (e) {
+          this.logger.error(`Failed to send close shift reminder to chatId=${chatId}: ${String(e)}`)
+        }
+      }
+    } catch (e) {
+      this.logger.error(`Failed to get chats for close shift reminder: ${String(e)}`)
     }
   }
 }
