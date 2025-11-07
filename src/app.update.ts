@@ -148,7 +148,7 @@ export class AppUpdate {
     }
   }
 
-  private async checkAndClosePollIfComplete(chatId: number, poll: any, ctx: Context) {
+  private async checkAndClosePollIfComplete(chatId: number, poll: any, ctx: Context, pollKey: string) {
     try {
       // Get total number of employees
       const totalEmployees = await this.usersService.countByRole(UserRole.EMPLOYEE)
@@ -170,6 +170,7 @@ export class AppUpdate {
           clearTimeout(poll.timeout)
           poll.timeout = undefined
         }
+        poll.expiresAt = null
         
         const goingList = poll.going.length > 0 ? poll.going.map(u => `@${u}`).join(', ') : 'никто'
         const notGoingList = poll.notGoing.length > 0 ? poll.notGoing.map(u => `@${u}`).join(', ') : 'никто'
@@ -183,11 +184,15 @@ export class AppUpdate {
         )
         Logger.log(`Poll auto-closed: all ${totalEmployees} employees voted in chatId=${chatId}`, 'AppUpdate')
         
+        await this.pollsService.markShiftPollClosed(pollKey)
+        await this.pollsService.saveShiftPollState(pollKey, { closed: true, expiresAt: null })
+
         // Create work shift records
         await this.createWorkShiftRecords(poll)
         
         return true
       }
+      await this.pollsService.saveShiftPollState(pollKey)
       return false
     } catch (e) {
       Logger.warn(`Failed to check poll completion: ${String(e)}`, 'AppUpdate')
@@ -652,6 +657,7 @@ export class AppUpdate {
       
       // Close previous poll if exists
       this.pollsService.clearShiftPollTimeout(pollKey)
+      await this.pollsService.deleteShiftPoll(pollKey)
       
       const message = await ctx.reply(
         '📋 Опрос: Кто завтра выходит на смену?\n⏱ Время на ответ: 30 минут\n\n✅ Выхожу: 0\n❌ Не выхожу: 0',
@@ -668,68 +674,79 @@ export class AppUpdate {
         } as any,
       )
       
-      const poll = { 
-        going: [], 
-        notGoing: [], 
+      const poll = {
+        going: [],
+        notGoing: [],
         messageId: (message as any).message_id,
         closed: false,
         timeout: undefined as NodeJS.Timeout | undefined,
         createdAt: new Date(),
-        chatId
+        chatId,
+        source: 'manual' as const,
+        extensionCount: 0,
+        expiresAt: null,
       }
-      
-      // Set 30 minute timeout
-      poll.timeout = setTimeout(async () => {
-        try {
-          // If nobody is going, keep the poll open and extend by 15 minutes
-          if ((poll.going?.length || 0) === 0) {
-            await ctx.reply('⏳ Никто не выбрал выход на смену. Опрос продлён на 15 минут. Пожалуйста, хотя бы один сотрудник должен выйти.');
-            // Extend timeout by 15 minutes
-            poll.timeout = setTimeout(async () => {
-              // After extension, if still nobody is going, just notify managers but do not close
-              if ((poll.going?.length || 0) === 0) {
-                await ctx.reply('❗ По-прежнему никто не выходит. Менеджеры, пожалуйста, уточните график. Опрос остаётся открытым.');
+
+      const scheduleTimeout = (durationMs: number) => {
+        if (poll.timeout) {
+          clearTimeout(poll.timeout)
+        }
+        const expiresAt = new Date(Date.now() + durationMs)
+        poll.expiresAt = expiresAt
+        void this.pollsService.updateShiftPollExpiration(pollKey, expiresAt, poll.extensionCount ?? 0)
+
+        poll.timeout = setTimeout(async () => {
+          try {
+            if ((poll.going?.length || 0) === 0) {
+              if ((poll.extensionCount ?? 0) === 0) {
+                await ctx.reply('⏳ Никто не выбрал выход на смену. Опрос продлён на 15 минут. Пожалуйста, хотя бы один сотрудник должен выйти.')
+                poll.extensionCount = 1
+                await this.pollsService.saveShiftPollState(pollKey, { extensionCount: poll.extensionCount })
+                scheduleTimeout(15 * 60 * 1000)
                 return
               }
-              // Close if someone is going
-              try {
-                const goingList = poll.going.length > 0 ? poll.going.map(u => `@${u}`).join(', ') : 'никто'
-                const notGoingList = poll.notGoing.length > 0 ? poll.notGoing.map(u => `@${u}`).join(', ') : 'никто'
-                await ctx.telegram.editMessageText(
-                  chatId,
-                  poll.messageId,
-                  undefined,
-                  `📋 Опрос завершён (продление истекло)\n\n✅ Выходят (${poll.going.length}): ${goingList}\n❌ Не выходят (${poll.notGoing.length}): ${notGoingList}`,
-                  { reply_markup: { inline_keyboard: [] } } as any
-                )
-                poll.closed = true
-                Logger.log(`Poll auto-closed after extension for chatId=${chatId}`, 'AppUpdate')
-                await this.createWorkShiftRecords(poll)
-              } catch (e) {
-                Logger.warn(`Failed to close poll after extension: ${String(e)}`, 'AppUpdate')
-              }
-            }, 15 * 60 * 1000)
-            return
+
+              await ctx.reply('❗ По-прежнему никто не выходит. Менеджеры, пожалуйста, уточните график. Опрос остаётся открытым.')
+              poll.timeout = undefined
+              poll.expiresAt = null
+              await this.pollsService.updateShiftPollExpiration(pollKey, null, poll.extensionCount ?? 1)
+              await this.pollsService.saveShiftPollState(pollKey)
+              return
+            }
+
+            const goingList = poll.going.length > 0 ? poll.going.map(u => `@${u}`).join(', ') : 'никто'
+            const notGoingList = poll.notGoing.length > 0 ? poll.notGoing.map(u => `@${u}`).join(', ') : 'никто'
+            await ctx.telegram.editMessageText(
+              chatId,
+              poll.messageId,
+              undefined,
+              `📋 Опрос завершён (30 минут истекло)\n\n✅ Выходят (${poll.going.length}): ${goingList}\n❌ Не выходят (${poll.notGoing.length}): ${notGoingList}`,
+              { reply_markup: { inline_keyboard: [] } } as any
+            )
+            poll.closed = true
+            poll.timeout = undefined
+            poll.expiresAt = null
+            await this.pollsService.markShiftPollClosed(pollKey)
+            await this.pollsService.saveShiftPollState(pollKey)
+            Logger.log(`Poll auto-closed for chatId=${chatId}`, 'AppUpdate')
+            await this.createWorkShiftRecords(poll)
+          } catch (e) {
+            Logger.warn(`Failed to close poll: ${String(e)}`, 'AppUpdate')
           }
-          // Close immediately if someone is going
-          const goingList = poll.going.length > 0 ? poll.going.map(u => `@${u}`).join(', ') : 'никто'
-          const notGoingList = poll.notGoing.length > 0 ? poll.notGoing.map(u => `@${u}`).join(', ') : 'никто'
-          await ctx.telegram.editMessageText(
-            chatId,
-            poll.messageId,
-            undefined,
-            `📋 Опрос завершён (30 минут истекло)\n\n✅ Выходят (${poll.going.length}): ${goingList}\n❌ Не выходят (${poll.notGoing.length}): ${notGoingList}`,
-            { reply_markup: { inline_keyboard: [] } } as any
-          )
-          poll.closed = true
-          Logger.log(`Poll auto-closed for chatId=${chatId}`, 'AppUpdate')
-          await this.createWorkShiftRecords(poll)
-        } catch (e) {
-          Logger.warn(`Failed to close poll: ${String(e)}`, 'AppUpdate')
-        }
-      }, 30 * 60 * 1000) // 30 minutes
-      
-      this.pollsService.setShiftPoll(pollKey, poll)
+        }, durationMs)
+      }
+
+      const initialTimeoutMs = 30 * 60 * 1000
+      const initialExpiresAt = new Date(Date.now() + initialTimeoutMs)
+      poll.expiresAt = initialExpiresAt
+
+      await this.pollsService.setShiftPoll(pollKey, poll, {
+        source: 'manual',
+        expiresAt: initialExpiresAt,
+        extensionCount: poll.extensionCount ?? 0,
+      })
+
+      scheduleTimeout(initialTimeoutMs)
       Logger.log(`Shift poll created by @${ctx.from?.username} in chatId=${chatId}`, 'AppUpdate')
     } catch (e) {
       Logger.warn(`poll command failed: ${String(e)}`, 'AppUpdate')
@@ -991,7 +1008,10 @@ export class AppUpdate {
       }
       
       const pollKey = `${chatId}:shift_poll`
-      const poll = this.pollsService.getShiftPoll(pollKey)
+      let poll = this.pollsService.getShiftPoll(pollKey)
+      if (!poll) {
+        poll = await this.pollsService.restoreShiftPoll(pollKey)
+      }
       if (!poll) {
         await ctx.answerCbQuery('Опрос не найден', { show_alert: true } as any)
         return
@@ -1010,7 +1030,7 @@ export class AppUpdate {
       }
       
       // Check if all employees voted
-      const allVoted = await this.checkAndClosePollIfComplete(chatId, poll, ctx)
+      const allVoted = await this.checkAndClosePollIfComplete(chatId, poll, ctx, pollKey)
       
       if (!allVoted) {
         const goingText = await this.formatShiftPollText(poll.going, 'Выхожу')
@@ -1029,6 +1049,7 @@ export class AppUpdate {
         } as any)
       }
       
+      await this.pollsService.saveShiftPollState(pollKey)
       await ctx.answerCbQuery('Ваш ответ учтён: Выхожу')
     } catch (e) {
       Logger.warn(`poll_yes failed: ${String(e)}`, 'AppUpdate')
@@ -1052,7 +1073,10 @@ export class AppUpdate {
       }
       
       const pollKey = `${chatId}:shift_poll`
-      const poll = this.pollsService.getShiftPoll(pollKey)
+      let poll = this.pollsService.getShiftPoll(pollKey)
+      if (!poll) {
+        poll = await this.pollsService.restoreShiftPoll(pollKey)
+      }
       if (!poll) {
         await ctx.answerCbQuery('Опрос не найден', { show_alert: true } as any)
         return
@@ -1071,7 +1095,7 @@ export class AppUpdate {
       }
       
       // Check if all employees voted
-      const allVoted = await this.checkAndClosePollIfComplete(chatId, poll, ctx)
+      const allVoted = await this.checkAndClosePollIfComplete(chatId, poll, ctx, pollKey)
       
       if (!allVoted) {
         const goingText = await this.formatShiftPollText(poll.going, 'Выхожу')
@@ -1090,6 +1114,7 @@ export class AppUpdate {
         } as any)
       }
       
+      await this.pollsService.saveShiftPollState(pollKey)
       await ctx.answerCbQuery('Ваш ответ учтён: Не выхожу')
     } catch (e) {
       Logger.warn(`poll_no failed: ${String(e)}`, 'AppUpdate')
@@ -1113,7 +1138,10 @@ export class AppUpdate {
       }
       
       const pollKey = `${chatId}:shift_poll`
-      const poll = this.pollsService.getShiftPoll(pollKey)
+      let poll = this.pollsService.getShiftPoll(pollKey)
+      if (!poll) {
+        poll = await this.pollsService.restoreShiftPoll(pollKey)
+      }
       if (!poll) {
         await ctx.answerCbQuery('Опрос не найден', { show_alert: true } as any)
         return
@@ -1148,6 +1176,9 @@ export class AppUpdate {
           Logger.warn(`Failed to update poll message: ${String(e)}`, 'AppUpdate')
         }
         
+        await this.pollsService.markShiftPollClosed(pollKey)
+        await this.pollsService.saveShiftPollState(pollKey, { closed: true, expiresAt: null })
+
         // Create work shift records
         await this.createWorkShiftRecords(poll)
       }
@@ -1157,6 +1188,7 @@ export class AppUpdate {
       
       const resultsText = `📊 Детальные результаты:\n\n✅ Выходят (${poll.going.length}):\n${goingList}\n\n❌ Не выходят (${poll.notGoing.length}):\n${notGoingList}`
       
+      await this.pollsService.saveShiftPollState(pollKey)
       await ctx.answerCbQuery()
       await ctx.reply(resultsText)
     } catch (e) {

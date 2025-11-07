@@ -1,6 +1,7 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Inject, Injectable, Logger } from '@nestjs/common';
+import { ShiftPollEntity, ShiftPollSource } from '../database/models/shift-polls/shift-poll.entity';
 
-interface ShiftPoll {
+export interface ShiftPoll {
   going: string[];
   notGoing: string[];
   messageId: number;
@@ -8,6 +9,10 @@ interface ShiftPoll {
   timeout?: NodeJS.Timeout;
   createdAt?: Date;
   chatId: number;
+  expiresAt?: Date | null;
+  source?: ShiftPollSource;
+  extensionCount?: number;
+  startedAt?: Date;
 }
 
 interface SyncPoll {
@@ -24,17 +29,120 @@ export class PollsService {
   private readonly shiftPolls = new Map<string, ShiftPoll>();
   private readonly syncPolls = new Map<string, SyncPoll>();
 
+  constructor(
+    @Inject('SHIFT_POLLS_REPOSITORY')
+    private readonly shiftPollRepository: typeof ShiftPollEntity,
+  ) {}
+
   // Shift polls (regular)
-  setShiftPoll(key: string, poll: ShiftPoll): void {
+  async setShiftPoll(
+    key: string,
+    poll: ShiftPoll,
+    options: { source: ShiftPollSource; expiresAt?: Date | null; extensionCount?: number } = {
+      source: 'manual',
+    },
+  ): Promise<void> {
+    poll.source = options.source;
+    poll.expiresAt = options.expiresAt ?? poll.expiresAt ?? null;
+    poll.extensionCount = options.extensionCount ?? poll.extensionCount ?? 0;
+    poll.startedAt = poll.startedAt ?? poll.createdAt ?? new Date();
+
     this.shiftPolls.set(key, poll);
+
+    await this.shiftPollRepository.upsert({
+      chatId: String(poll.chatId),
+      messageId: poll.messageId,
+      going: poll.going,
+      notGoing: poll.notGoing,
+      expiresAt: poll.expiresAt ?? null,
+      closed: poll.closed,
+      source: poll.source,
+      extensionCount: poll.extensionCount ?? 0,
+      startedAt: poll.startedAt,
+    });
   }
 
   getShiftPoll(key: string): ShiftPoll | undefined {
     return this.shiftPolls.get(key);
   }
 
-  deleteShiftPoll(key: string): void {
+  async restoreShiftPoll(key: string): Promise<ShiftPoll | undefined> {
+    try {
+      const [chatId] = key.split(':');
+      const record = await this.shiftPollRepository.findOne({
+        where: { chatId, closed: false },
+        order: [['startedAt', 'DESC']],
+      });
+
+      if (!record) {
+        return undefined;
+      }
+
+      const poll: ShiftPoll = {
+        going: Array.isArray(record.going) ? [...record.going] : [],
+        notGoing: Array.isArray(record.notGoing) ? [...record.notGoing] : [],
+        messageId: record.messageId,
+        closed: record.closed,
+        timeout: undefined,
+        createdAt: record.startedAt ?? record.createdAt,
+        chatId: Number(record.chatId),
+        expiresAt: record.expiresAt ? new Date(record.expiresAt) : null,
+        source: record.source,
+        extensionCount: record.extensionCount ?? 0,
+        startedAt: record.startedAt ?? record.createdAt,
+      };
+
+      this.shiftPolls.set(key, poll);
+      return poll;
+    } catch (e) {
+      this.logger.error(`Failed to restore shift poll for key=${key}: ${String(e)}`);
+      return undefined;
+    }
+  }
+
+  async saveShiftPollState(key: string, overrides: Partial<ShiftPoll> = {}): Promise<void> {
+    const poll = this.shiftPolls.get(key);
+    if (!poll) {
+      this.logger.warn(`Attempted to save shift poll state but no poll found for key=${key}`);
+      return;
+    }
+
+    Object.assign(poll, overrides);
+
+    try {
+      await this.shiftPollRepository.upsert({
+        chatId: String(poll.chatId),
+        messageId: poll.messageId,
+        going: poll.going,
+        notGoing: poll.notGoing,
+        expiresAt: poll.expiresAt ?? null,
+        closed: poll.closed,
+        source: poll.source ?? 'manual',
+        extensionCount: poll.extensionCount ?? 0,
+        startedAt: poll.startedAt ?? poll.createdAt ?? new Date(),
+      });
+    } catch (e) {
+      this.logger.error(`Failed to persist shift poll state for key=${key}: ${String(e)}`);
+    }
+  }
+
+  async deleteShiftPoll(key: string): Promise<void> {
+    const poll = this.shiftPolls.get(key);
+    if (poll?.timeout) {
+      clearTimeout(poll.timeout);
+    }
     this.shiftPolls.delete(key);
+
+    try {
+      const [chatId] = key.split(':');
+      const where: any = { chatId };
+      if (poll?.messageId) {
+        where.messageId = poll.messageId;
+      }
+      await this.shiftPollRepository.destroy({ where });
+    } catch (e) {
+      this.logger.error(`Failed to remove shift poll from store for key=${key}: ${String(e)}`);
+    }
   }
 
   clearShiftPollTimeout(key: string): void {
@@ -42,6 +150,57 @@ export class PollsService {
     if (poll?.timeout) {
       clearTimeout(poll.timeout);
     }
+  }
+
+  async updateShiftPollExpiration(key: string, expiresAt: Date | null, extensionCount = 0): Promise<void> {
+    const poll = this.shiftPolls.get(key);
+    if (poll) {
+      poll.expiresAt = expiresAt;
+      poll.extensionCount = extensionCount;
+    }
+
+    try {
+      const [chatId] = key.split(':');
+      const where: any = { chatId, closed: false };
+      if (poll?.messageId) {
+        where.messageId = poll.messageId;
+      }
+      await this.shiftPollRepository.update(
+        { expiresAt, extensionCount },
+        { where },
+      );
+    } catch (e) {
+      this.logger.error(`Failed to update shift poll expiration for key=${key}: ${String(e)}`);
+    }
+  }
+
+  async markShiftPollClosed(key: string): Promise<void> {
+    const poll = this.shiftPolls.get(key);
+    if (poll) {
+      poll.closed = true;
+      if (poll.timeout) {
+        clearTimeout(poll.timeout);
+        poll.timeout = undefined;
+      }
+    }
+
+    try {
+      const [chatId] = key.split(':');
+      const where: any = { chatId };
+      if (poll?.messageId) {
+        where.messageId = poll.messageId;
+      }
+      await this.shiftPollRepository.update({ closed: true, expiresAt: null }, { where });
+    } catch (e) {
+      this.logger.error(`Failed to mark shift poll closed for key=${key}: ${String(e)}`);
+    }
+  }
+
+  async getActiveShiftPollsBySource(source: ShiftPollSource): Promise<ShiftPollEntity[]> {
+    return this.shiftPollRepository.findAll({
+      where: { source, closed: false },
+      order: [['startedAt', 'ASC']],
+    });
   }
 
   // Sync polls

@@ -2,6 +2,7 @@ import {Sequelize} from "sequelize-typescript";
 import {User} from "./models/users/user.entity";
 import {WorkShift} from "./models/work-shifts/work-shift.entity";
 import {Chat} from "./models/chats/chat.entity";
+import { ShiftPollEntity } from './models/shift-polls/shift-poll.entity';
 import { ConfigService } from '@nestjs/config'
 // import { join } from 'path'
 
@@ -20,7 +21,7 @@ export const databaseProviders = [
                 //entities: join(__dirname, '**', '*.entity.{ts, js}'),
                 //migrations: join(__dirname, '**', '*.migration.{ts,js}'),
             });
-            sequelize.addModels([User, WorkShift, Chat]);
+            sequelize.addModels([User, WorkShift, Chat, ShiftPollEntity]);
             
             // Fix shift column type if needed
             try {

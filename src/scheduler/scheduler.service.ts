@@ -3,14 +3,18 @@ import { ConfigService } from '@nestjs/config';
 import { InjectBot } from 'nestjs-telegraf';
 import { Telegraf } from 'telegraf';
 import * as cron from 'node-cron';
+import { ScheduledTask } from 'node-cron';
 import { WorkShiftsService } from '../database/models/work-shifts/work-shifts.service';
 import { ChatsService } from '../database/models/chats/chats.service';
-import { PollsService } from '../polls/polls.service';
+import { PollsService, ShiftPoll } from '../polls/polls.service';
 import { UsersService } from '../database/models/users/users.service';
 
 @Injectable()
 export class SchedulerService implements OnModuleInit {
   private readonly logger = new Logger(SchedulerService.name);
+  private reminderOpenTask?: ScheduledTask;
+  private reminderCloseTask?: ScheduledTask;
+  private shiftPollTask?: ScheduledTask;
 
   constructor(
     @InjectBot() private readonly bot: Telegraf,
@@ -28,7 +32,7 @@ export class SchedulerService implements OnModuleInit {
     }
   }
 
-  onModuleInit() {
+  async onModuleInit() {
     try {
       this.logger.log('SchedulerService onModuleInit called');
       const timezone = this.configService.get<string>('TIMEZONE') || 'Asia/Novosibirsk';
@@ -72,7 +76,7 @@ export class SchedulerService implements OnModuleInit {
       */
       
       // Daily reminder at 08:50 to open shift
-      const reminderOpenTask = cron.schedule('50 8 * * *', async () => {
+      this.reminderOpenTask = cron.schedule('50 8 * * *', async () => {
         try {
           const triggerTime = new Date();
           this.logger.log(`[CRON] Open shift reminder trigger at 08:50 (${timezone}) - Current time: ${triggerTime.toISOString()}`);
@@ -84,14 +88,15 @@ export class SchedulerService implements OnModuleInit {
         timezone
       });
       
-      if (reminderOpenTask) {
+      if (this.reminderOpenTask) {
+        this.reminderOpenTask.start();
         this.logger.log('Open shift reminder cron task scheduled successfully');
       } else {
         this.logger.error('Failed to schedule open shift reminder cron task!');
       }
 
       // Daily poll at 20:00 - "Who is on shift tomorrow?"
-      const pollTask = cron.schedule('0 20 * * *', async () => {
+      this.shiftPollTask = cron.schedule('0 20 * * *', async () => {
         try {
           const triggerTime = new Date();
           this.logger.log(`[CRON] Shift poll trigger at 20:00 (${timezone}) - Current time: ${triggerTime.toISOString()}`);
@@ -103,14 +108,15 @@ export class SchedulerService implements OnModuleInit {
         timezone
       });
       
-      if (pollTask) {
+      if (this.shiftPollTask) {
+        this.shiftPollTask.start();
         this.logger.log('Shift poll cron task scheduled successfully');
       } else {
         this.logger.error('Failed to schedule shift poll cron task!');
       }
 
       // Daily reminder at 20:55 to close shift
-      const reminderCloseTask = cron.schedule('55 20 * * *', async () => {
+      this.reminderCloseTask = cron.schedule('55 20 * * *', async () => {
         try {
           const triggerTime = new Date();
           this.logger.log(`[CRON] Close shift reminder trigger at 20:55 (${timezone}) - Current time: ${triggerTime.toISOString()}`);
@@ -122,13 +128,16 @@ export class SchedulerService implements OnModuleInit {
         timezone
       });
       
-      if (reminderCloseTask) {
+      if (this.reminderCloseTask) {
+        this.reminderCloseTask.start();
         this.logger.log('Close shift reminder cron task scheduled successfully');
       } else {
         this.logger.error('Failed to schedule close shift reminder cron task!');
       }
 
       this.logger.log(`Scheduler initialized successfully. Open shift reminder at 08:50 (${timezone}), shift poll at 20:00 (${timezone}), close shift reminder at 20:55 (${timezone})`);
+
+      await this.restoreScheduledPolls();
     } catch (error) {
       this.logger.error(`Failed to initialize scheduler: ${String(error)}`, error instanceof Error ? error.stack : '');
     }
@@ -201,61 +210,24 @@ export class SchedulerService implements OnModuleInit {
             closed: false,
             timeout: undefined as NodeJS.Timeout | undefined,
             createdAt: new Date(),
-            chatId
+            chatId,
+            source: 'scheduler' as const,
+            extensionCount: 0,
+            expiresAt: null,
           };
-          
-          // Set 30 minute timeout
-          poll.timeout = setTimeout(async () => {
-            try {
-              // If nobody is going, keep the poll open and extend by 15 minutes
-              if ((poll.going?.length || 0) === 0) {
-                await this.bot.telegram.sendMessage(chatId, '⏳ Никто не выбрал выход на смену. Опрос продлён на 15 минут. Пожалуйста, хотя бы один сотрудник должен выйти.');
-                // Extend timeout by 15 minutes
-                poll.timeout = setTimeout(async () => {
-                  // After extension, if still nobody is going, just notify managers but do not close
-                  if ((poll.going?.length || 0) === 0) {
-                    await this.bot.telegram.sendMessage(chatId, '❗ По-прежнему никто не выходит. Менеджеры, пожалуйста, уточните график. Опрос остаётся открытым.');
-                    return;
-                  }
-                  // Close if someone is going
-                  try {
-                    const goingList = poll.going.length > 0 ? poll.going.map(u => `@${u}`).join(', ') : 'никто';
-                    const notGoingList = poll.notGoing.length > 0 ? poll.notGoing.map(u => `@${u}`).join(', ') : 'никто';
-                    await this.bot.telegram.editMessageText(
-                      chatId,
-                      poll.messageId,
-                      undefined,
-                      `📋 Опрос завершён (продление истекло)\n\n✅ Выходят (${poll.going.length}): ${goingList}\n❌ Не выходят (${poll.notGoing.length}): ${notGoingList}`,
-                      { reply_markup: { inline_keyboard: [] } } as any
-                    );
-                    poll.closed = true;
-                    this.logger.log(`Poll auto-closed after extension for chatId=${chatId}`);
-                    await this.createWorkShiftRecords(poll);
-                  } catch (e) {
-                    this.logger.warn(`Failed to close poll after extension: ${String(e)}`);
-                  }
-                }, 15 * 60 * 1000);
-                return;
-              }
-              // Close immediately if someone is going
-              const goingList = poll.going.length > 0 ? poll.going.map(u => `@${u}`).join(', ') : 'никто';
-              const notGoingList = poll.notGoing.length > 0 ? poll.notGoing.map(u => `@${u}`).join(', ') : 'никто';
-              await this.bot.telegram.editMessageText(
-                chatId,
-                poll.messageId,
-                undefined,
-                `📋 Опрос завершён (30 минут истекло)\n\n✅ Выходят (${poll.going.length}): ${goingList}\n❌ Не выходят (${poll.notGoing.length}): ${notGoingList}`,
-                { reply_markup: { inline_keyboard: [] } } as any
-              );
-              poll.closed = true;
-              this.logger.log(`Poll auto-closed for chatId=${chatId}`);
-              await this.createWorkShiftRecords(poll);
-            } catch (e) {
-              this.logger.warn(`Failed to close poll: ${String(e)}`);
-            }
-          }, 30 * 60 * 1000); // 30 minutes
-          
-          this.pollsService.setShiftPoll(pollKey, poll);
+
+          const initialTimeoutMs = 30 * 60 * 1000;
+          const initialExpiresAt = new Date(Date.now() + initialTimeoutMs);
+          poll.expiresAt = initialExpiresAt;
+
+          await this.pollsService.setShiftPoll(pollKey, poll, {
+            source: 'scheduler',
+            expiresAt: initialExpiresAt,
+            extensionCount: 0,
+          });
+
+          this.scheduleAutoPollTimeout(pollKey, poll, initialTimeoutMs);
+
           this.logger.log(`✅ Scheduled poll sent successfully to chatId=${chatId}, messageId=${(message as any).message_id}`);
         } catch (e) {
           const errorMessage = e instanceof Error ? e.message : String(e);
@@ -275,6 +247,128 @@ export class SchedulerService implements OnModuleInit {
       }
     } catch (e) {
       this.logger.error(`Failed to get chats for scheduled poll: ${String(e)}`);
+    }
+  }
+
+  private scheduleAutoPollTimeout(pollKey: string, poll: ShiftPoll, durationMs: number) {
+    if (poll.timeout) {
+      clearTimeout(poll.timeout);
+    }
+
+    const expiresAt = new Date(Date.now() + durationMs);
+    poll.expiresAt = expiresAt;
+
+    void this.pollsService.updateShiftPollExpiration(pollKey, expiresAt, poll.extensionCount ?? 0);
+
+    poll.timeout = setTimeout(async () => {
+      await this.handleAutoPollTimeout(pollKey, poll);
+    }, durationMs);
+  }
+
+  private async handleAutoPollTimeout(pollKey: string, poll: ShiftPoll) {
+    const chatId = poll.chatId;
+
+    try {
+      const goingCount = poll.going?.length ?? 0;
+      const notGoingCount = poll.notGoing?.length ?? 0;
+
+      if (goingCount === 0) {
+        const extensionCount = poll.extensionCount ?? 0;
+
+        if (extensionCount === 0) {
+          await this.bot.telegram.sendMessage(
+            chatId,
+            '⏳ Никто не выбрал выход на смену. Опрос продлён на 15 минут. Пожалуйста, хотя бы один сотрудник должен выйти.',
+          );
+
+          poll.extensionCount = 1;
+          await this.pollsService.saveShiftPollState(pollKey, { extensionCount: poll.extensionCount });
+
+          this.scheduleAutoPollTimeout(pollKey, poll, 15 * 60 * 1000);
+          return;
+        }
+
+        await this.bot.telegram.sendMessage(
+          chatId,
+          '❗ По-прежнему никто не выходит. Менеджеры, пожалуйста, уточните график. Опрос остаётся открытым.',
+        );
+
+        poll.timeout = undefined;
+        poll.expiresAt = null;
+        await this.pollsService.updateShiftPollExpiration(pollKey, null, poll.extensionCount ?? 1);
+        await this.pollsService.saveShiftPollState(pollKey, {});
+        return;
+      }
+
+      const goingList = goingCount > 0 ? poll.going.map((u) => `@${u}`).join(', ') : 'никто';
+      const notGoingList = notGoingCount > 0 ? poll.notGoing.map((u) => `@${u}`).join(', ') : 'никто';
+
+      await this.bot.telegram.editMessageText(
+        chatId,
+        poll.messageId,
+        undefined,
+        `📋 Опрос завершён (30 минут истекло)\n\n✅ Выходят (${goingCount}): ${goingList}\n❌ Не выходят (${notGoingCount}): ${notGoingList}`,
+        { reply_markup: { inline_keyboard: [] } } as any,
+      );
+
+      poll.closed = true;
+      poll.timeout = undefined;
+      poll.expiresAt = null;
+
+      await this.pollsService.markShiftPollClosed(pollKey);
+      await this.pollsService.saveShiftPollState(pollKey, {});
+
+      this.logger.log(`Poll auto-closed for chatId=${chatId}`);
+      await this.createWorkShiftRecords(poll);
+    } catch (error) {
+      this.logger.warn(`Failed to handle auto poll timeout for chatId=${chatId}: ${String(error)}`);
+    }
+  }
+
+  private async restoreScheduledPolls() {
+    try {
+      const activePolls = await this.pollsService.getActiveShiftPollsBySource('scheduler');
+
+      if (activePolls.length === 0) {
+        this.logger.log('No active scheduled shift polls to restore.');
+        return;
+      }
+
+      this.logger.log(`Restoring ${activePolls.length} scheduled shift polls after restart.`);
+
+      for (const state of activePolls) {
+        const pollKey = `${state.chatId}:shift_poll`;
+        let poll = this.pollsService.getShiftPoll(pollKey);
+        if (!poll) {
+          poll = await this.pollsService.restoreShiftPoll(pollKey);
+        }
+
+        if (!poll) {
+          this.logger.warn(`Failed to restore in-memory state for poll key=${pollKey}`);
+          continue;
+        }
+
+        const expiresAt = state.expiresAt ? new Date(state.expiresAt) : null;
+        const now = Date.now();
+        const remaining = expiresAt ? expiresAt.getTime() - now : 0;
+
+        poll.extensionCount = state.extensionCount ?? poll.extensionCount ?? 0;
+
+        if (!expiresAt) {
+          this.logger.log(`Poll for chatId=${state.chatId} has no expiration (likely extended without responses). Skipping timeout recreation.`);
+          continue;
+        }
+
+        if (remaining <= 0) {
+          this.logger.log(`Poll for chatId=${state.chatId} expired during downtime. Handling timeout immediately.`);
+          await this.handleAutoPollTimeout(pollKey, poll);
+        } else {
+          this.logger.log(`Rescheduling poll timeout for chatId=${state.chatId} in ${Math.ceil(remaining / 1000)} seconds.`);
+          this.scheduleAutoPollTimeout(pollKey, poll, remaining);
+        }
+      }
+    } catch (error) {
+      this.logger.error(`Failed to restore scheduled shift polls: ${String(error)}`);
     }
   }
 
