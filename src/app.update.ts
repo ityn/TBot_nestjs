@@ -750,12 +750,20 @@ export class AppUpdate {
       return
     }
     try {
-      const callerTgId = String(ctx.from?.id)
-      const isGroupAdmin = await isAdmin(ctx)
-      const caller = await this.usersService.findOneByTelegramId(callerTgId)
-      if (!isGroupAdmin && (!caller || !hasRole(caller, UserRole.MANAGER))) {
-        await this.replyWithName(ctx, 'У вас нет прав для создания опроса. Требуется роль: Менеджер или выше, либо права администратора группы.')
-        return
+      const state = (ctx.state ?? {}) as Record<string, any>
+      const skipPermissionCheck = Boolean(state?.skipPermissionCheck)
+      const pollSource = (state?.pollSource as 'manual' | 'scheduler') ?? 'manual'
+
+      if (!skipPermissionCheck) {
+        const callerTgId = String(ctx.from?.id)
+        const isGroupAdmin = await isAdmin(ctx)
+        const caller = await this.usersService.findOneByTelegramId(callerTgId)
+        if (!isGroupAdmin && (!caller || !hasRole(caller, UserRole.MANAGER))) {
+          await this.replyWithName(ctx, 'У вас нет прав для создания опроса. Требуется роль: Менеджер или выше, либо права администратора группы.')
+          return
+        }
+      } else {
+        Logger.debug(`Skipping permission checks for poll command (source=${pollSource})`, 'AppUpdate')
       }
       const chatRecord = await this.guardChatAccess(ctx)
       if (!chatRecord) {
@@ -795,7 +803,7 @@ export class AppUpdate {
         timeout: undefined as NodeJS.Timeout | undefined,
         createdAt: new Date(),
         chatId,
-        source: 'manual' as const,
+        source: pollSource,
         extensionCount: 0,
         expiresAt: null,
       }
@@ -815,14 +823,14 @@ export class AppUpdate {
               const maxExtensions = 3
               if (extensionCount < maxExtensions) {
                 const nextExtension = extensionCount + 1
-                await ctx.reply('⏳ Никто не выбрал выход на смену. Опрос продлён ещё на 15 минут. Пожалуйста, отметьтесь.')
+                  await ctx.reply(`⏳ Никто не выбрал выход на смену. Опрос продлён на 15 минут (попытка ${nextExtension} из ${maxExtensions}). Пожалуйста, хотя бы один сотрудник должен выйти.`)
                 poll.extensionCount = nextExtension
                 await this.pollsService.saveShiftPollState(pollKey, { extensionCount: poll.extensionCount })
                 scheduleTimeout(15 * 60 * 1000)
                 return
               }
 
-              await ctx.reply('❌ Никто так и не выбрал выход на смену. Опрос закрыт.')
+                await ctx.reply('❌ Опрос удалён: никто не выбрал выход на смену после нескольких продлений. Пожалуйста, создайте новый опрос вручную, если необходимо.')
               try {
                 await ctx.telegram.deleteMessage(chatId, poll.messageId)
               } catch (deleteErr) {
@@ -861,13 +869,13 @@ export class AppUpdate {
       poll.expiresAt = initialExpiresAt
 
       await this.pollsService.setShiftPoll(pollKey, poll, {
-        source: 'manual',
+        source: pollSource,
         expiresAt: initialExpiresAt,
         extensionCount: poll.extensionCount ?? 0,
       })
 
       scheduleTimeout(initialTimeoutMs)
-      Logger.log(`Shift poll created by @${ctx.from?.username} in chatId=${chatId}`, 'AppUpdate')
+      Logger.log(`Shift poll created by @${ctx.from?.username} in chatId=${chatId} (source=${pollSource})`, 'AppUpdate')
     } catch (e) {
       Logger.warn(`poll command failed: ${String(e)}`, 'AppUpdate')
       await this.replyWithName(ctx, 'Ошибка при создании опроса.')

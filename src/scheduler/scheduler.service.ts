@@ -1,5 +1,6 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { ModuleRef } from '@nestjs/core';
 import { InjectBot } from 'nestjs-telegraf';
 import { Telegraf } from 'telegraf';
 import * as cron from 'node-cron';
@@ -8,7 +9,9 @@ import { WorkShiftsService } from '../database/models/work-shifts/work-shifts.se
 import { ChatsService } from '../database/models/chats/chats.service';
 import { PollsService, ShiftPoll } from '../polls/polls.service';
 import { UsersService } from '../database/models/users/users.service';
-import { ChatEnvironment } from '../database/models/chats/chat.entity';
+import { Chat, ChatEnvironment } from '../database/models/chats/chat.entity';
+import { UserFromGetMe } from 'telegraf/typings/core/types/typegram';
+import { AppUpdate } from '../app.update';
 
 @Injectable()
 export class SchedulerService implements OnModuleInit {
@@ -18,6 +21,8 @@ export class SchedulerService implements OnModuleInit {
   private shiftPollTask?: ScheduledTask;
   private readonly chatEnvironment: ChatEnvironment;
   private readonly isDevMode: boolean;
+  private botInfo?: UserFromGetMe;
+  private appUpdateInstance?: AppUpdate;
 
   constructor(
     @InjectBot() private readonly bot: Telegraf,
@@ -26,6 +31,7 @@ export class SchedulerService implements OnModuleInit {
     private readonly chatsService: ChatsService,
     private readonly pollsService: PollsService,
     private readonly usersService: UsersService,
+    private readonly moduleRef: ModuleRef,
   ) {
     this.logger.log('SchedulerService constructor called');
     this.chatEnvironment = this.resolveChatEnvironment();
@@ -113,6 +119,13 @@ export class SchedulerService implements OnModuleInit {
       }
       */
       
+      try {
+        this.botInfo = await this.bot.telegram.getMe();
+        this.logger.log(`Bot info resolved: @${this.botInfo.username}`);
+      } catch (botInfoError) {
+        this.logger.warn(`Failed to resolve bot info: ${String(botInfoError)}`);
+      }
+
       // Daily reminder at 08:50 to open shift
       this.reminderOpenTask = cron.schedule('50 8 * * *', async () => {
         try {
@@ -153,10 +166,12 @@ export class SchedulerService implements OnModuleInit {
         this.logger.error('Failed to schedule close shift reminder cron task!');
       }
 
-      this.shiftPollTask = cron.schedule('0 19 * * *', async () => {
+      this.shiftPollTask = cron.schedule('30 19 * * *', async () => {
         try {
           const triggerTime = new Date();
-          this.logger.log(`[CRON] Shift poll trigger at 19:00 (${timezone}) - Current time: ${triggerTime.toISOString()}`);
+          this.logger.log(
+            `[CRON] Shift poll trigger at 19:30 (${timezone}) - Current time: ${triggerTime.toISOString()} (executing /poll)`,
+          );
           await this.sendAutoPoll();
         } catch (error) {
           this.logger.error(`Error in shift poll cron task: ${String(error)}`, error instanceof Error ? error.stack : '');
@@ -167,12 +182,12 @@ export class SchedulerService implements OnModuleInit {
 
       if (this.shiftPollTask) {
         this.shiftPollTask.start();
-        this.logger.log('Shift poll cron task scheduled successfully for 19:00');
+        this.logger.log('Shift poll cron task scheduled successfully for 19:30');
       } else {
         this.logger.error('Failed to schedule shift poll cron task!');
       }
 
-      this.logger.log(`Scheduler initialized successfully. Open shift reminder at 08:50 (${timezone}), shift poll at 19:00 (${timezone}), close shift reminder at 20:55 (${timezone})`);
+      this.logger.log(`Scheduler initialized successfully. Open shift reminder at 08:50 (${timezone}), shift poll at 19:30 (${timezone}), close shift reminder at 20:55 (${timezone})`);
 
       await this.restoreScheduledPolls();
     } catch (error) {
@@ -182,8 +197,8 @@ export class SchedulerService implements OnModuleInit {
 
   async sendAutoPoll() {
     try {
-      this.logger.log('sendAutoPoll() called - starting poll sending process');
-      // Get all active chats
+      this.logger.log('sendAutoPoll() called - executing /poll command for eligible chats');
+
       const chats = await this.chatsService.findAll({
         onlyActive: true,
         environment: this.isDevMode ? this.chatEnvironment : undefined,
@@ -200,100 +215,110 @@ export class SchedulerService implements OnModuleInit {
         return;
       }
 
-      // Log all chat IDs for debugging
       chats.forEach((chat, index) => {
         this.logger.log(
           `Chat ${index + 1}: chatId='${chat.chatId}' (type: ${typeof chat.chatId}), title='${chat.title || 'N/A'}', type='${chat.type || 'N/A'}', env='${chat.environment}', active=${chat.isActive}`,
         );
       });
 
-      // Send poll to all chats
       for (const chat of chats) {
-        const chatId = Number(chat.chatId);
-        const pollKey = `${chatId}:shift_poll`;
-        
-        this.logger.log(`Attempting to send poll to chatId=${chatId} (original: '${chat.chatId}')`);
-        
         try {
-          // Verify bot is available
-          if (!this.bot || !this.bot.telegram) {
-            this.logger.error(`Bot or bot.telegram is not available for chatId=${chatId}`);
-            continue;
-          }
-          
-          // Verify bot can access the chat
-          try {
-            this.logger.log(`Checking bot access to chatId=${chatId}...`);
-            await this.bot.telegram.getChat(chatId);
-            this.logger.log(`Bot has access to chatId=${chatId}`);
-          } catch (accessError) {
-            this.logger.warn(`Bot cannot access chatId=${chatId}: ${String(accessError)}. Skipping this chat.`);
-            continue;
-          }
-          
-          this.logger.log(`Calling bot.telegram.sendMessage for chatId=${chatId}...`);
-          const message = await this.bot.telegram.sendMessage(
-            chatId,
-            '📋 Опрос: Кто завтра выходит на смену?\n⏱ Время на ответ: 30 минут\n\n✅ Выхожу: 0\n❌ Не выхожу: 0',
-            {
-              reply_markup: {
-                inline_keyboard: [
-                  [
-                    { text: '✅ Выхожу', callback_data: `poll_yes:${chatId}` },
-                    { text: '❌ Не выхожу', callback_data: `poll_no:${chatId}` },
-                  ],
-                  [{ text: '📊 Результаты (Менеджеры)', callback_data: `poll_results:${chatId}` }],
-                ],
-              },
-            } as any,
-          );
-
-          // Create poll record and set timeout
-          const poll = { 
-            going: [], 
-            notGoing: [], 
-            messageId: (message as any).message_id,
-            closed: false,
-            timeout: undefined as NodeJS.Timeout | undefined,
-            createdAt: new Date(),
-            chatId,
-            source: 'scheduler' as const,
-            extensionCount: 0,
-            expiresAt: null,
-          };
-
-          const initialTimeoutMs = 30 * 60 * 1000;
-          const initialExpiresAt = new Date(Date.now() + initialTimeoutMs);
-          poll.expiresAt = initialExpiresAt;
-
-          await this.pollsService.setShiftPoll(pollKey, poll, {
-            source: 'scheduler',
-            expiresAt: initialExpiresAt,
-            extensionCount: 0,
-          });
-
-          this.scheduleAutoPollTimeout(pollKey, poll, initialTimeoutMs);
-
-          this.logger.log(`✅ Scheduled poll sent successfully to chatId=${chatId}, messageId=${(message as any).message_id}`);
+          await this.executePollCommandForChat(chat);
         } catch (e) {
           const errorMessage = e instanceof Error ? e.message : String(e);
           const errorStack = e instanceof Error ? e.stack : '';
-          this.logger.error(`❌ Failed to send scheduled poll to chatId=${chatId}: ${errorMessage}`);
+          const chatId = chat.chatId;
+          this.logger.error(`❌ Failed to run /poll for chatId=${chatId}: ${errorMessage}`);
           if (errorStack) {
             this.logger.error(`Error stack: ${errorStack}`);
-          }
-          // Log specific error types
-          if (e && typeof e === 'object' && 'response' in e) {
-            this.logger.error(`Telegram API response: ${JSON.stringify((e as any).response)}`);
-          }
-          if (e && typeof e === 'object' && 'code' in e) {
-            this.logger.error(`Error code: ${(e as any).code}`);
           }
         }
       }
     } catch (e) {
       this.logger.error(`Failed to get chats for scheduled poll: ${String(e)}`);
     }
+  }
+
+  private async getAppUpdateInstance(): Promise<AppUpdate | null> {
+    if (this.appUpdateInstance) {
+      return this.appUpdateInstance;
+    }
+    try {
+      this.appUpdateInstance = await this.moduleRef.resolve(AppUpdate, undefined, { strict: false });
+      return this.appUpdateInstance;
+    } catch (error) {
+      this.logger.error(`Failed to resolve AppUpdate instance: ${String(error)}`);
+      return null;
+    }
+  }
+
+  private async executePollCommandForChat(chat: Chat): Promise<void> {
+    const chatIdNumber = Number(chat.chatId);
+    if (Number.isNaN(chatIdNumber)) {
+      this.logger.warn(`Skipping chat with invalid chatId='${chat.chatId}'`);
+      return;
+    }
+
+    if (!this.bot || !this.bot.telegram) {
+      this.logger.error('Bot instance unavailable while executing scheduled /poll command');
+      return;
+    }
+
+    try {
+      await this.bot.telegram.getChat(chatIdNumber);
+    } catch (accessError) {
+      this.logger.warn(`Bot cannot access chatId=${chatIdNumber}: ${String(accessError)}. Skipping this chat.`);
+      return;
+    }
+
+    const appUpdate = await this.getAppUpdateInstance();
+    if (!appUpdate) {
+      this.logger.error('AppUpdate instance not available. Cannot execute /poll command.');
+      return;
+    }
+
+    const updateId = Date.now();
+    const messageId = Math.floor(updateId / 1000);
+    const fakeFrom = {
+      id: 0,
+      is_bot: true,
+      first_name: 'Автопланировщик',
+      username: 'auto_scheduler',
+    };
+
+    const chatType = (chat.type as any) || 'supergroup';
+
+    const fakeMessage = {
+      message_id: messageId,
+      date: Math.floor(Date.now() / 1000),
+      chat: {
+        id: chatIdNumber,
+        type: chatType,
+        title: chat.title ?? undefined,
+      },
+      from: fakeFrom,
+      text: '/poll',
+      entities: [{ offset: 0, length: 5, type: 'bot_command' }],
+    };
+
+    const fakeCtx: any = {
+      chat: fakeMessage.chat,
+      from: fakeFrom,
+      telegram: this.bot.telegram,
+      message: fakeMessage,
+      update: { update_id: updateId, message: fakeMessage },
+      updateType: 'message',
+      state: { skipPermissionCheck: true, pollSource: 'scheduler', schedulerInvoke: true },
+      botInfo: this.botInfo,
+      reply: (text: string, extra?: any) => this.bot.telegram.sendMessage(chatIdNumber, text, extra),
+    };
+
+    fakeCtx.getChat = () => this.bot.telegram.getChat(chatIdNumber);
+    fakeCtx.getChatAdministrators = () => this.bot.telegram.getChatAdministrators(chatIdNumber);
+    fakeCtx.getChatMember = (userId: number) => this.bot.telegram.getChatMember(chatIdNumber, userId);
+
+    await appUpdate.createShiftPoll(fakeCtx);
+    this.logger.log(`✅ Scheduled /poll command executed successfully for chatId=${chatIdNumber}`);
   }
 
   private scheduleAutoPollTimeout(pollKey: string, poll: ShiftPoll, durationMs: number) {
@@ -326,7 +351,7 @@ export class SchedulerService implements OnModuleInit {
           const nextExtension = extensionCount + 1;
           await this.bot.telegram.sendMessage(
             chatId,
-            '⏳ Никто не выбрал выход на смену. Опрос продлён ещё на 15 минут. Пожалуйста, отметьтесь.',
+            `⏳ Никто не выбрал выход на смену. Опрос продлён на 15 минут (попытка ${nextExtension} из ${maxExtensions}). Пожалуйста, хотя бы один сотрудник должен выйти.`,
           );
 
           poll.extensionCount = nextExtension;
@@ -338,7 +363,7 @@ export class SchedulerService implements OnModuleInit {
 
         await this.bot.telegram.sendMessage(
           chatId,
-          '❌ Никто так и не выбрал выход на смену. Опрос закрыт.',
+          '❌ Опрос удалён: никто не выбрал выход на смену после нескольких продлений. Пожалуйста, создайте новый опрос вручную, если необходимо.',
         );
 
         try {
