@@ -1,4 +1,5 @@
 import { Logger } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { AppService } from './app.service';
 import { Action, Ctx, InjectBot, Message, On, Update, Help, Command, Start, Hears } from 'nestjs-telegraf';
 import { Context, Telegraf } from 'telegraf';
@@ -10,6 +11,7 @@ import { TelegramClientService } from './telegram/telegram-client.service';
 import { WorkShiftsService } from './database/models/work-shifts/work-shifts.service';
 import { ChatsService } from './database/models/chats/chats.service';
 import { PollsService } from './polls/polls.service';
+import { Chat, ChatEnvironment } from './database/models/chats/chat.entity';
 
 const pendingVerifications = new Map<string, NodeJS.Timeout>()
 const pendingShiftClosures = new Map<string, { workShiftId: number, step: 'awaiting_items' }>()
@@ -19,16 +21,101 @@ const pendingShiftClosures = new Map<string, { workShiftId: number, step: 'await
 @Update()
 export class AppUpdate {
   private readonly logger = new Logger(AppUpdate.name);
+  private readonly chatEnvironment: ChatEnvironment;
+  private readonly isDevMode: boolean;
   
   constructor(
       @InjectBot() private readonly bot: Telegraf<Context>,
+      private readonly configService: ConfigService,
       private readonly appService: AppService,
       private readonly usersService: UsersService,
       private readonly telegramClient: TelegramClientService,
       private readonly workShiftsService: WorkShiftsService,
       private readonly chatsService: ChatsService,
       private readonly pollsService: PollsService,
-  ) {}
+  ) {
+    this.chatEnvironment = this.resolveChatEnvironment();
+    this.isDevMode = this.chatEnvironment === 'dev';
+    this.logger.log(
+      `AppUpdate initialized for environment: ${this.chatEnvironment}${
+        this.isDevMode ? ' (dev mode: only dev chats)' : ' (prod mode: all active chats)'
+      }`,
+    );
+  }
+
+  private normalizeEnvironment(value?: string | null): ChatEnvironment {
+    const normalized = (value ?? '').trim().toLowerCase();
+    if (['dev', 'development', 'test', 'qa', 'staging'].includes(normalized)) {
+      return 'dev';
+    }
+    return 'prod';
+  }
+
+  private resolveChatEnvironment(): ChatEnvironment {
+    const candidates = [
+      this.configService.get<string>('CHAT_ENVIRONMENT'),
+      this.configService.get<string>('BOT_ENVIRONMENT'),
+      this.configService.get<string>('NODE_ENV'),
+      process.env.CHAT_ENVIRONMENT,
+      process.env.BOT_ENVIRONMENT,
+      process.env.NODE_ENV,
+    ];
+
+    for (const candidate of candidates) {
+      if (candidate && candidate.trim().length > 0) {
+        return this.normalizeEnvironment(candidate);
+      }
+    }
+
+    return 'prod';
+  }
+
+  private async registerChat(
+    chatId: string,
+    title?: string | null,
+    type?: string | null,
+    isActive = true,
+  ): Promise<[Chat, boolean]> {
+    return this.chatsService.findOrCreate(chatId, title, type, this.chatEnvironment, isActive);
+  }
+
+  private async guardChatAccess(ctx: Context): Promise<Chat | null> {
+    const chatId = ctx.chat?.id;
+    if (!chatId) {
+      await this.replyWithName(ctx, 'Не удалось определить текущий чат.');
+      return null;
+    }
+    const title = (ctx.chat as any)?.title || null;
+    const type = ctx.chat?.type || null;
+    const [chat, created] = await this.registerChat(String(chatId), title, type, true);
+
+    if (created) {
+      this.logger.log(`Chat ${chatId} registered (environment=${this.chatEnvironment}) via guardChatAccess`);
+    }
+
+    if (!chat.isActive) {
+      await this.replyWithName(ctx, 'Этот чат помечен как неактивный. Обратитесь к администратору, чтобы активировать его.');
+      return null;
+    }
+
+    if (chat.environment !== this.chatEnvironment) {
+      if (this.isDevMode) {
+        this.logger.warn(
+          `Chat ${chatId} environment mismatch: chat=${chat.environment}, bot=${this.chatEnvironment}. Commands blocked in dev mode.`,
+        );
+        await this.replyWithName(
+          ctx,
+          `Этот чат относится к окружению "${chat.environment}". Текущий бот запущен в окружении "${this.chatEnvironment}". Команды для этого чата доступны в соответствующем окружении.`,
+        );
+        return null;
+      }
+      this.logger.warn(
+        `Chat ${chatId} environment mismatch: chat=${chat.environment}, bot=${this.chatEnvironment}. Allowed (prod mode).`,
+      );
+    }
+
+    return chat;
+  }
 
   private replyWithName(ctx: Context, message: string): Promise<any> {
     const firstName = ctx.from?.first_name
@@ -214,12 +301,19 @@ export class AppUpdate {
     const chatId = ctx.chat?.id;
     if (chatId) {
       try {
-        const existingChat = await this.chatsService.findOneByChatId(String(chatId));
-        if (!existingChat) {
-          const title = (ctx.chat as any).title || null;
-          const type = ctx.chat?.type || null;
-          await this.chatsService.findOrCreate(String(chatId), title, type);
-          this.logger.log(`Chat ${chatId} auto-registered in database from message handler`);
+        const title = (ctx.chat as any).title || null;
+        const type = ctx.chat?.type || null;
+        const [chat, created] = await this.registerChat(String(chatId), title, type, true);
+        if (created) {
+          this.logger.log(
+            `Chat ${chatId} auto-registered in database from message handler (env=${this.chatEnvironment})`,
+          );
+        } else if (!chat.isActive) {
+          this.logger.warn(`Chat ${chatId} is marked inactive (env=${chat.environment})`);
+        } else if (chat.environment !== this.chatEnvironment) {
+          this.logger.warn(
+            `Chat ${chatId} environment mismatch: stored=${chat.environment}, bot=${this.chatEnvironment}`,
+          );
         }
       } catch (e) {
         this.logger.warn(`Failed to register chat ${chatId}: ${String(e)}`);
@@ -332,8 +426,18 @@ export class AppUpdate {
         // Save chat to database
         const title = (ctx.chat as any).title || null;
         const type = ctx.chat?.type || null;
-        await this.chatsService.findOrCreate(String(chatId), title, type);
-        Logger.log(`Chat ${chatId} registered`, 'AppUpdate');
+        const existingChat = await this.chatsService.findOneByChatId(String(chatId));
+        const wasInactive = existingChat ? !existingChat.isActive : false;
+        const previousEnv = existingChat?.environment;
+        const [chat, created] = await this.registerChat(String(chatId), title, type, true);
+        if (created) {
+          Logger.log(`Chat ${chatId} registered (env=${chat.environment})`, 'AppUpdate');
+        } else if (wasInactive && chat.isActive) {
+          Logger.log(`Chat ${chatId} reactivated (env=${chat.environment})`, 'AppUpdate');
+        }
+        if (previousEnv && chat.environment !== previousEnv) {
+          Logger.warn(`Chat ${chatId} environment changed: ${previousEnv} -> ${chat.environment}`, 'AppUpdate');
+        }
         
         // Fetch admins (we can get their user info)
         const admins = await ctx.telegram.getChatAdministrators(chatId)
@@ -393,14 +497,12 @@ export class AppUpdate {
             }
           }
           
-          // Delete work shifts for this chat
-          const deletedShifts = await this.workShiftsService.deleteByChatId(String(chatId))
-          Logger.log(`Deleted ${deletedShifts} work shifts for chatId=${chatId}`, 'AppUpdate')
-          
-          // Delete chat from database
-          const deletedChats = await this.chatsService.remove(String(chatId))
-          Logger.log(`Removed ${deletedChats} chat record(s) for chatId=${chatId}`, 'AppUpdate')
-          
+          const updatedChat = await this.chatsService.markActivity(String(chatId), false)
+          if (updatedChat) {
+            Logger.log(`Chat ${chatId} marked as inactive (env=${updatedChat.environment})`, 'AppUpdate')
+          } else {
+            Logger.warn(`Chat ${chatId} not found when marking inactive`, 'AppUpdate')
+          }
         } catch (e) {
           Logger.error(`Failed to cleanup data for chatId=${chatId}: ${String(e)}`, 'AppUpdate')
         }
@@ -530,7 +632,10 @@ export class AppUpdate {
       let message = `📋 Найдено чатов в базе: ${chats.length}\n\n`
       chats.forEach((chat, index) => {
         const isCurrentChat = chat.chatId === String(ctx.chat?.id)
-        message += `${isCurrentChat ? '✅' : '📌'} ${index + 1}. ID: ${chat.chatId}, Название: ${chat.title || 'N/A'}, Тип: ${chat.type || 'N/A'}\n`
+        const statusEmoji = chat.isActive ? '🟢' : '🔴'
+        const envLabel = chat.environment === 'prod' ? 'prod' : 'dev'
+        message += `${isCurrentChat ? '👉' : '📌'} ${index + 1}. ID: ${chat.chatId}, Название: ${chat.title || 'N/A'}, Тип: ${chat.type || 'N/A'}\n`
+        message += `   Статус: ${statusEmoji} ${chat.isActive ? 'активен' : 'неактивен'}, окружение: ${envLabel}\n`
       })
       
       const currentChatId = String(ctx.chat?.id)
@@ -540,8 +645,12 @@ export class AppUpdate {
         try {
           const title = (ctx.chat as any).title || null
           const type = ctx.chat?.type || null
-          await this.chatsService.findOrCreate(currentChatId, title, type)
-          message += `\n✅ Текущий чат (${currentChatId}) зарегистрирован в базе данных.`
+          const [chat, created] = await this.registerChat(currentChatId, title, type, true)
+          if (created) {
+            message += `\n✅ Текущий чат (${currentChatId}) зарегистрирован в базе данных (env=${chat.environment}).`
+          } else {
+            message += `\n✅ Текущий чат (${currentChatId}) активирован (env=${chat.environment}).`
+          }
           this.logger.log(`Chat ${currentChatId} registered via checkchats command`)
         } catch (e) {
           message += `\n❌ Ошибка регистрации текущего чата: ${String(e)}`
@@ -648,7 +757,11 @@ export class AppUpdate {
         await this.replyWithName(ctx, 'У вас нет прав для создания опроса. Требуется роль: Менеджер или выше, либо права администратора группы.')
         return
       }
-      const chatId = ctx.chat?.id as number
+      const chatRecord = await this.guardChatAccess(ctx)
+      if (!chatRecord) {
+        return
+      }
+      const chatId = Number(chatRecord.chatId)
       const pollKey = `${chatId}:shift_poll`
       
       // If poll created manually by manager/admin - check and fix existing shifts
@@ -698,19 +811,26 @@ export class AppUpdate {
         poll.timeout = setTimeout(async () => {
           try {
             if ((poll.going?.length || 0) === 0) {
-              if ((poll.extensionCount ?? 0) === 0) {
-                await ctx.reply('⏳ Никто не выбрал выход на смену. Опрос продлён на 15 минут. Пожалуйста, хотя бы один сотрудник должен выйти.')
-                poll.extensionCount = 1
+              const extensionCount = poll.extensionCount ?? 0
+              const maxExtensions = 3
+              if (extensionCount < maxExtensions) {
+                const nextExtension = extensionCount + 1
+                await ctx.reply('⏳ Никто не выбрал выход на смену. Опрос продлён ещё на 15 минут. Пожалуйста, отметьтесь.')
+                poll.extensionCount = nextExtension
                 await this.pollsService.saveShiftPollState(pollKey, { extensionCount: poll.extensionCount })
                 scheduleTimeout(15 * 60 * 1000)
                 return
               }
 
-              await ctx.reply('❗ По-прежнему никто не выходит. Менеджеры, пожалуйста, уточните график. Опрос остаётся открытым.')
+              await ctx.reply('❌ Никто так и не выбрал выход на смену. Опрос закрыт.')
+              try {
+                await ctx.telegram.deleteMessage(chatId, poll.messageId)
+              } catch (deleteErr) {
+                Logger.warn(`Failed to delete poll message in chatId=${chatId}: ${String(deleteErr)}`, 'AppUpdate')
+              }
               poll.timeout = undefined
               poll.expiresAt = null
-              await this.pollsService.updateShiftPollExpiration(pollKey, null, poll.extensionCount ?? 1)
-              await this.pollsService.saveShiftPollState(pollKey)
+              await this.pollsService.deleteShiftPoll(pollKey)
               return
             }
 

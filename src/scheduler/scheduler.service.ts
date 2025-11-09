@@ -8,6 +8,7 @@ import { WorkShiftsService } from '../database/models/work-shifts/work-shifts.se
 import { ChatsService } from '../database/models/chats/chats.service';
 import { PollsService, ShiftPoll } from '../polls/polls.service';
 import { UsersService } from '../database/models/users/users.service';
+import { ChatEnvironment } from '../database/models/chats/chat.entity';
 
 @Injectable()
 export class SchedulerService implements OnModuleInit {
@@ -15,6 +16,8 @@ export class SchedulerService implements OnModuleInit {
   private reminderOpenTask?: ScheduledTask;
   private reminderCloseTask?: ScheduledTask;
   private shiftPollTask?: ScheduledTask;
+  private readonly chatEnvironment: ChatEnvironment;
+  private readonly isDevMode: boolean;
 
   constructor(
     @InjectBot() private readonly bot: Telegraf,
@@ -25,6 +28,9 @@ export class SchedulerService implements OnModuleInit {
     private readonly usersService: UsersService,
   ) {
     this.logger.log('SchedulerService constructor called');
+    this.chatEnvironment = this.resolveChatEnvironment();
+    this.isDevMode = this.chatEnvironment === 'dev';
+    this.logger.log(`SchedulerService chat environment filter: ${this.chatEnvironment}`);
     if (!this.bot) {
       this.logger.error('CRITICAL: Bot is not available in constructor! @InjectBot() failed.');
     } else {
@@ -32,11 +38,43 @@ export class SchedulerService implements OnModuleInit {
     }
   }
 
+  private normalizeEnvironment(value?: string | null): ChatEnvironment {
+    const normalized = (value ?? '').trim().toLowerCase();
+    if (['dev', 'development', 'test', 'qa', 'staging'].includes(normalized)) {
+      return 'dev';
+    }
+    return 'prod';
+  }
+
+  private resolveChatEnvironment(): ChatEnvironment {
+    const candidates = [
+      this.configService.get<string>('CHAT_ENVIRONMENT'),
+      this.configService.get<string>('BOT_ENVIRONMENT'),
+      this.configService.get<string>('NODE_ENV'),
+      process.env.CHAT_ENVIRONMENT,
+      process.env.BOT_ENVIRONMENT,
+      process.env.NODE_ENV,
+    ];
+
+    for (const candidate of candidates) {
+      if (candidate && candidate.trim().length > 0) {
+        return this.normalizeEnvironment(candidate);
+      }
+    }
+
+    return 'prod';
+  }
+
   async onModuleInit() {
     try {
       this.logger.log('SchedulerService onModuleInit called');
       const timezone = this.configService.get<string>('TIMEZONE') || 'Asia/Novosibirsk';
       this.logger.log(`Using timezone: ${timezone}`);
+      this.logger.log(
+        `Targeting chats in environment: ${this.chatEnvironment}${
+          this.isDevMode ? ' (dev mode: only dev chats)' : ' (prod mode: all active chats)'
+        }`,
+      );
       
       // Log current time in timezone
       const now = new Date();
@@ -95,26 +133,6 @@ export class SchedulerService implements OnModuleInit {
         this.logger.error('Failed to schedule open shift reminder cron task!');
       }
 
-      // Daily poll at 20:00 - "Who is on shift tomorrow?"
-      this.shiftPollTask = cron.schedule('0 20 * * *', async () => {
-        try {
-          const triggerTime = new Date();
-          this.logger.log(`[CRON] Shift poll trigger at 20:00 (${timezone}) - Current time: ${triggerTime.toISOString()}`);
-          await this.sendAutoPoll();
-        } catch (error) {
-          this.logger.error(`Error in shift poll cron task: ${String(error)}`, error instanceof Error ? error.stack : '');
-        }
-      }, { 
-        timezone
-      });
-      
-      if (this.shiftPollTask) {
-        this.shiftPollTask.start();
-        this.logger.log('Shift poll cron task scheduled successfully');
-      } else {
-        this.logger.error('Failed to schedule shift poll cron task!');
-      }
-
       // Daily reminder at 20:55 to close shift
       this.reminderCloseTask = cron.schedule('55 20 * * *', async () => {
         try {
@@ -135,7 +153,26 @@ export class SchedulerService implements OnModuleInit {
         this.logger.error('Failed to schedule close shift reminder cron task!');
       }
 
-      this.logger.log(`Scheduler initialized successfully. Open shift reminder at 08:50 (${timezone}), shift poll at 20:00 (${timezone}), close shift reminder at 20:55 (${timezone})`);
+      this.shiftPollTask = cron.schedule('0 19 * * *', async () => {
+        try {
+          const triggerTime = new Date();
+          this.logger.log(`[CRON] Shift poll trigger at 19:00 (${timezone}) - Current time: ${triggerTime.toISOString()}`);
+          await this.sendAutoPoll();
+        } catch (error) {
+          this.logger.error(`Error in shift poll cron task: ${String(error)}`, error instanceof Error ? error.stack : '');
+        }
+      }, {
+        timezone
+      });
+
+      if (this.shiftPollTask) {
+        this.shiftPollTask.start();
+        this.logger.log('Shift poll cron task scheduled successfully for 19:00');
+      } else {
+        this.logger.error('Failed to schedule shift poll cron task!');
+      }
+
+      this.logger.log(`Scheduler initialized successfully. Open shift reminder at 08:50 (${timezone}), shift poll at 19:00 (${timezone}), close shift reminder at 20:55 (${timezone})`);
 
       await this.restoreScheduledPolls();
     } catch (error) {
@@ -147,18 +184,27 @@ export class SchedulerService implements OnModuleInit {
     try {
       this.logger.log('sendAutoPoll() called - starting poll sending process');
       // Get all active chats
-      const chats = await this.chatsService.findAll();
+      const chats = await this.chatsService.findAll({
+        onlyActive: true,
+        environment: this.isDevMode ? this.chatEnvironment : undefined,
+      });
       this.logger.log(`Found ${chats.length} active chats in database`);
       
       if (chats.length === 0) {
-        this.logger.warn('No active chats found in database. Skipping scheduled poll.');
+        this.logger.warn(
+          this.isDevMode
+            ? `No active chats found for environment=${this.chatEnvironment}. Skipping scheduled poll.`
+            : 'No active chats found. Skipping scheduled poll.',
+        );
         this.logger.warn('NOTE: Chats are registered when bot is added to a group via onBotAddedToChat handler.');
         return;
       }
 
       // Log all chat IDs for debugging
       chats.forEach((chat, index) => {
-        this.logger.log(`Chat ${index + 1}: chatId='${chat.chatId}' (type: ${typeof chat.chatId}), title='${chat.title || 'N/A'}', type='${chat.type || 'N/A'}'`);
+        this.logger.log(
+          `Chat ${index + 1}: chatId='${chat.chatId}' (type: ${typeof chat.chatId}), title='${chat.title || 'N/A'}', type='${chat.type || 'N/A'}', env='${chat.environment}', active=${chat.isActive}`,
+        );
       });
 
       // Send poll to all chats
@@ -274,14 +320,16 @@ export class SchedulerService implements OnModuleInit {
 
       if (goingCount === 0) {
         const extensionCount = poll.extensionCount ?? 0;
+        const maxExtensions = 3;
 
-        if (extensionCount === 0) {
+        if (extensionCount < maxExtensions) {
+          const nextExtension = extensionCount + 1;
           await this.bot.telegram.sendMessage(
             chatId,
-            '⏳ Никто не выбрал выход на смену. Опрос продлён на 15 минут. Пожалуйста, хотя бы один сотрудник должен выйти.',
+            '⏳ Никто не выбрал выход на смену. Опрос продлён ещё на 15 минут. Пожалуйста, отметьтесь.',
           );
 
-          poll.extensionCount = 1;
+          poll.extensionCount = nextExtension;
           await this.pollsService.saveShiftPollState(pollKey, { extensionCount: poll.extensionCount });
 
           this.scheduleAutoPollTimeout(pollKey, poll, 15 * 60 * 1000);
@@ -290,13 +338,16 @@ export class SchedulerService implements OnModuleInit {
 
         await this.bot.telegram.sendMessage(
           chatId,
-          '❗ По-прежнему никто не выходит. Менеджеры, пожалуйста, уточните график. Опрос остаётся открытым.',
+          '❌ Никто так и не выбрал выход на смену. Опрос закрыт.',
         );
 
-        poll.timeout = undefined;
-        poll.expiresAt = null;
-        await this.pollsService.updateShiftPollExpiration(pollKey, null, poll.extensionCount ?? 1);
-        await this.pollsService.saveShiftPollState(pollKey, {});
+        try {
+          await this.bot.telegram.deleteMessage(chatId, poll.messageId);
+        } catch (deleteErr) {
+          this.logger.warn(`Failed to delete poll message for chatId=${chatId}: ${String(deleteErr)}`);
+        }
+
+        await this.pollsService.deleteShiftPoll(pollKey);
         return;
       }
 
@@ -338,6 +389,31 @@ export class SchedulerService implements OnModuleInit {
 
       for (const state of activePolls) {
         const pollKey = `${state.chatId}:shift_poll`;
+
+        try {
+          const chatRecord = await this.chatsService.findOneByChatId(String(state.chatId));
+          if (!chatRecord) {
+            this.logger.warn(`Skipping poll restoration: chatId=${state.chatId} not found.`);
+            await this.pollsService.deleteShiftPoll(pollKey);
+            continue;
+          }
+          if (!chatRecord.isActive) {
+            this.logger.log(`Skipping poll restoration for inactive chatId=${state.chatId}.`);
+            await this.pollsService.deleteShiftPoll(pollKey);
+            continue;
+          }
+          if (this.isDevMode && chatRecord.environment !== this.chatEnvironment) {
+            this.logger.log(
+              `Skipping poll restoration for chatId=${state.chatId} due to environment mismatch (${chatRecord.environment} !== ${this.chatEnvironment}).`,
+            );
+            await this.pollsService.deleteShiftPoll(pollKey);
+            continue;
+          }
+        } catch (chatError) {
+          this.logger.warn(`Failed to validate chat ${state.chatId} for poll restoration: ${String(chatError)}`);
+          continue;
+        }
+
         let poll = this.pollsService.getShiftPoll(pollKey);
         if (!poll) {
           poll = await this.pollsService.restoreShiftPoll(pollKey);
@@ -438,10 +514,17 @@ export class SchedulerService implements OnModuleInit {
   async remindOpenShift(timezone: string) {
     try {
       // Get all active chats
-      const chats = await this.chatsService.findAll();
+      const chats = await this.chatsService.findAll({
+        onlyActive: true,
+        environment: this.isDevMode ? this.chatEnvironment : undefined,
+      });
       
       if (chats.length === 0) {
-        this.logger.warn('No active chats found. Skipping open shift reminder.');
+        this.logger.warn(
+          this.isDevMode
+            ? `No active chats for environment=${this.chatEnvironment}. Skipping open shift reminder.`
+            : 'No active chats found. Skipping open shift reminder.',
+        );
         return;
       }
 
@@ -499,10 +582,17 @@ export class SchedulerService implements OnModuleInit {
   async remindCloseShift(timezone: string) {
     try {
       // Get all active chats
-      const chats = await this.chatsService.findAll();
+      const chats = await this.chatsService.findAll({
+        onlyActive: true,
+        environment: this.isDevMode ? this.chatEnvironment : undefined,
+      });
       
       if (chats.length === 0) {
-        this.logger.warn('No active chats found. Skipping close shift reminder.');
+        this.logger.warn(
+          this.isDevMode
+            ? `No active chats for environment=${this.chatEnvironment}. Skipping close shift reminder.`
+            : 'No active chats found. Skipping close shift reminder.',
+        );
         return;
       }
 

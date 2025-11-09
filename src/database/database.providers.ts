@@ -49,6 +49,14 @@ export const databaseProviders = [
             } catch (e) {
                 console.warn('Could not auto-fix shift column type:', e);
             }
+
+            // Ensure default values for chats metadata
+            try {
+                await sequelize.query(`UPDATE chats SET "isActive" = TRUE WHERE "isActive" IS NULL`);
+                await sequelize.query(`UPDATE chats SET "environment" = 'prod' WHERE "environment" IS NULL OR LENGTH(TRIM("environment")) = 0`);
+            } catch (e) {
+                console.warn('Could not backfill chats metadata defaults:', e);
+            }
             
             await sequelize.sync({ alter: true });
             return sequelize;

@@ -1,9 +1,13 @@
 import { Column, DataType, Model, Table } from 'sequelize-typescript';
 
+export type ChatEnvironment = 'prod' | 'dev';
+
 interface ChatCreationAttrs {
     chatId: string;
     title?: string | null;
     type?: string | null;
+    isActive?: boolean;
+    environment?: ChatEnvironment;
 }
 
 @Table({ tableName: 'chats' })
@@ -22,5 +26,11 @@ export class Chat extends Model<Chat, ChatCreationAttrs> {
 
     @Column({ type: DataType.DATE, allowNull: true, defaultValue: DataType.NOW })
     addedAt: Date;
+
+    @Column({ type: DataType.BOOLEAN, allowNull: false, defaultValue: true })
+    isActive: boolean;
+
+    @Column({ type: DataType.STRING, allowNull: false, defaultValue: 'prod' })
+    environment: ChatEnvironment;
 }
 

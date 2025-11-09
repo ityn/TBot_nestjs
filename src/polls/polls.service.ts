@@ -28,11 +28,71 @@ export class PollsService {
   private readonly logger = new Logger(PollsService.name);
   private readonly shiftPolls = new Map<string, ShiftPoll>();
   private readonly syncPolls = new Map<string, SyncPoll>();
+  private shiftPollTableReady = false;
+  private ensureShiftPollTablePromise: Promise<void> | null = null;
 
   constructor(
     @Inject('SHIFT_POLLS_REPOSITORY')
     private readonly shiftPollRepository: typeof ShiftPollEntity,
   ) {}
+
+  private async ensureShiftPollTable(): Promise<boolean> {
+    if (this.shiftPollTableReady) {
+      return true;
+    }
+
+    if (this.ensureShiftPollTablePromise) {
+      try {
+        await this.ensureShiftPollTablePromise;
+        return this.shiftPollTableReady;
+      } catch {
+        return false;
+      }
+    }
+
+    this.ensureShiftPollTablePromise = (async () => {
+      try {
+        await this.shiftPollRepository.sync();
+
+        const sequelize = this.shiftPollRepository.sequelize;
+        if (sequelize) {
+          const qi = sequelize.getQueryInterface();
+          try {
+            await qi.addConstraint('shift_polls', {
+              fields: ['chatId', 'messageId'],
+              type: 'unique',
+              name: 'shift_polls_chat_message_unique',
+            });
+            this.logger.log('Unique constraint shift_polls_chat_message_unique ensured');
+          } catch (constraintError: any) {
+            const message = constraintError?.message ?? '';
+            if (message.includes('already exists')) {
+              this.logger.debug('Unique constraint shift_polls_chat_message_unique already exists');
+            } else {
+              this.logger.warn(`Could not ensure unique constraint for shift_polls: ${String(constraintError)}`);
+            }
+          }
+        } else {
+          this.logger.warn('Sequelize instance not available for ShiftPollEntity; cannot ensure unique constraint');
+        }
+
+        this.shiftPollTableReady = true;
+        this.logger.log('Shift poll table is ready (sync successful)');
+      } catch (e) {
+        this.logger.error(`Failed to ensure shift poll table: ${String(e)}`);
+        throw e;
+      } finally {
+        this.ensureShiftPollTablePromise = null;
+      }
+    })();
+
+    try {
+      await this.ensureShiftPollTablePromise;
+      return this.shiftPollTableReady;
+    } catch {
+      return false;
+    }
+  }
 
   // Shift polls (regular)
   async setShiftPoll(
@@ -49,17 +109,38 @@ export class PollsService {
 
     this.shiftPolls.set(key, poll);
 
-    await this.shiftPollRepository.upsert({
-      chatId: String(poll.chatId),
-      messageId: poll.messageId,
-      going: poll.going,
-      notGoing: poll.notGoing,
-      expiresAt: poll.expiresAt ?? null,
-      closed: poll.closed,
-      source: poll.source,
-      extensionCount: poll.extensionCount ?? 0,
-      startedAt: poll.startedAt,
-    });
+    const tableReady = await this.ensureShiftPollTable();
+    if (!tableReady) {
+      this.logger.warn('Shift poll table unavailable; poll state is kept only in memory');
+      return;
+    }
+
+    try {
+      const chatId = String(poll.chatId);
+      const existing = await this.shiftPollRepository.findOne({
+        where: { chatId, messageId: poll.messageId },
+      });
+
+      const payload = {
+        chatId,
+        messageId: poll.messageId,
+        going: poll.going,
+        notGoing: poll.notGoing,
+        expiresAt: poll.expiresAt ?? null,
+        closed: poll.closed,
+        source: poll.source,
+        extensionCount: poll.extensionCount ?? 0,
+        startedAt: poll.startedAt,
+      };
+
+      if (existing) {
+        await existing.update(payload);
+      } else {
+        await this.shiftPollRepository.create(payload);
+      }
+    } catch (e) {
+      this.logger.error(`Failed to persist shift poll (key=${key}): ${String(e)}`);
+    }
   }
 
   getShiftPoll(key: string): ShiftPoll | undefined {
@@ -67,6 +148,12 @@ export class PollsService {
   }
 
   async restoreShiftPoll(key: string): Promise<ShiftPoll | undefined> {
+    const tableReady = await this.ensureShiftPollTable();
+    if (!tableReady) {
+      this.logger.warn(`Cannot restore shift poll (table not ready) for key=${key}`);
+      return undefined;
+    }
+
     try {
       const [chatId] = key.split(':');
       const record = await this.shiftPollRepository.findOne({
@@ -109,9 +196,16 @@ export class PollsService {
 
     Object.assign(poll, overrides);
 
+    const tableReady = await this.ensureShiftPollTable();
+    if (!tableReady) {
+      this.logger.warn(`Shift poll table unavailable; state persisted in memory only (key=${key})`);
+      return;
+    }
+
     try {
-      await this.shiftPollRepository.upsert({
-        chatId: String(poll.chatId),
+      const chatId = String(poll.chatId);
+      const payload = {
+        chatId,
         messageId: poll.messageId,
         going: poll.going,
         notGoing: poll.notGoing,
@@ -120,7 +214,17 @@ export class PollsService {
         source: poll.source ?? 'manual',
         extensionCount: poll.extensionCount ?? 0,
         startedAt: poll.startedAt ?? poll.createdAt ?? new Date(),
+      };
+
+      const existing = await this.shiftPollRepository.findOne({
+        where: { chatId, messageId: poll.messageId },
       });
+
+      if (existing) {
+        await existing.update(payload);
+      } else {
+        await this.shiftPollRepository.create(payload);
+      }
     } catch (e) {
       this.logger.error(`Failed to persist shift poll state for key=${key}: ${String(e)}`);
     }
@@ -132,6 +236,12 @@ export class PollsService {
       clearTimeout(poll.timeout);
     }
     this.shiftPolls.delete(key);
+
+    const tableReady = await this.ensureShiftPollTable();
+    if (!tableReady) {
+      this.logger.warn(`Shift poll table unavailable; deleted in-memory state only (key=${key})`);
+      return;
+    }
 
     try {
       const [chatId] = key.split(':');
@@ -159,6 +269,12 @@ export class PollsService {
       poll.extensionCount = extensionCount;
     }
 
+    const tableReady = await this.ensureShiftPollTable();
+    if (!tableReady) {
+      this.logger.warn(`Shift poll table unavailable; expiration update skipped (key=${key})`);
+      return;
+    }
+
     try {
       const [chatId] = key.split(':');
       const where: any = { chatId, closed: false };
@@ -184,6 +300,12 @@ export class PollsService {
       }
     }
 
+    const tableReady = await this.ensureShiftPollTable();
+    if (!tableReady) {
+      this.logger.warn(`Shift poll table unavailable; markClosed persisted in memory only (key=${key})`);
+      return;
+    }
+
     try {
       const [chatId] = key.split(':');
       const where: any = { chatId };
@@ -197,6 +319,12 @@ export class PollsService {
   }
 
   async getActiveShiftPollsBySource(source: ShiftPollSource): Promise<ShiftPollEntity[]> {
+    const tableReady = await this.ensureShiftPollTable();
+    if (!tableReady) {
+      this.logger.warn(`Shift poll table unavailable; returning in-memory active polls for source=${source}`);
+      return [];
+    }
+
     return this.shiftPollRepository.findAll({
       where: { source, closed: false },
       order: [['startedAt', 'ASC']],
